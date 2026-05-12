@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 
 	"golang.org/x/term"
@@ -68,9 +69,9 @@ func run(w io.Writer, args []string) error {
 	case "list":
 		return handleList(w, cfg, sess, api, *accountHint)
 	case "add":
-		return printPlaceholder(w, "vm add")
+		return handleAdd(w, cfg, sess, api, *accountHint, rest[1:])
 	case "delete":
-		return printPlaceholder(w, "vm delete")
+		return handleDelete(w, cfg, sess, api, *accountHint, rest[1:])
 	case "poweron":
 		return handlePowerAction(w, cfg, sess, api, *accountHint, rest[1:], "poweron")
 	case "poweroff":
@@ -80,7 +81,7 @@ func run(w io.Writer, args []string) error {
 	case "ssh":
 		return handleSSH(cfg, sess, api, *accountHint, rest[1:])
 	case "port":
-		return handlePort(w, rest[1:])
+		return handlePort(w, cfg, sess, api, *accountHint, rest[1:])
 	case "help":
 		return printRootHelp(w, cfg, sess)
 	default:
@@ -509,6 +510,105 @@ func handleList(w io.Writer, cfg config.Config, sess session.State, api *client.
 	return nil
 }
 
+func handleAdd(w io.Writer, cfg config.Config, sess session.State, api *client.Client, accountHint string, args []string) error {
+	account, err := resolveAccount(cfg, sess, api, accountHint)
+	if err != nil {
+		return err
+	}
+	templates, err := api.ListTemplates(account.UUID)
+	if err != nil {
+		return handleClientError(cfg.BaseURL, err)
+	}
+	if len(templates) == 0 {
+		return errors.New("no templates are available")
+	}
+	reader := bufio.NewReader(os.Stdin)
+	vmName := strings.TrimSpace(firstArg(args))
+	if vmName == "" {
+		vmName, err = prompt(reader, "VM name", "")
+		if err != nil {
+			return err
+		}
+	}
+
+	templateArg := strings.TrimSpace(secondArg(args))
+	guestPortArg := ""
+	template := templates[0]
+	if len(templates) > 1 {
+		templateChoice := templateArg
+		if templateChoice == "" {
+			templateChoice, err = prompt(reader, "Template UUID or name", template.Name)
+			if err != nil {
+				return err
+			}
+		}
+		template, err = resolveTemplate(templates, templateChoice)
+		if err != nil {
+			return err
+		}
+		guestPortArg = strings.TrimSpace(thirdArg(args))
+	} else {
+		if templateArg != "" {
+			if _, convErr := strconv.Atoi(templateArg); convErr == nil {
+				guestPortArg = templateArg
+			} else {
+				template, err = resolveTemplate(templates, templateArg)
+				if err != nil {
+					return err
+				}
+				guestPortArg = strings.TrimSpace(thirdArg(args))
+			}
+		}
+	}
+	guestPort := 80
+	if portValue := strings.TrimSpace(guestPortArg); portValue != "" {
+		if guestPort, err = strconv.Atoi(portValue); err != nil {
+			return errors.New("guest web port must be numeric")
+		}
+	} else {
+		portValue, err := prompt(reader, "Guest web port", "80")
+		if err != nil {
+			return err
+		}
+		if guestPort, err = strconv.Atoi(strings.TrimSpace(portValue)); err != nil {
+			return errors.New("guest web port must be numeric")
+		}
+	}
+	vm, err := api.CreateVM(account.UUID, vmName, template.UUID, guestPort)
+	if err != nil {
+		return handleClientError(cfg.BaseURL, err)
+	}
+	_, err = fmt.Fprintf(w, "Created VM %s (%s) state=%s ssh-port=%d web-port=%d\n", vm.Name, vm.UUID, vm.State, vm.HostSSHPort, vm.HostWebPort)
+	return err
+}
+
+func handleDelete(w io.Writer, cfg config.Config, sess session.State, api *client.Client, accountHint string, args []string) error {
+	if len(args) == 0 {
+		return errors.New("delete requires a VM name")
+	}
+	vmName := strings.TrimSpace(args[0])
+	force := hasFlag(args[1:], "--force")
+	if !force {
+		reader := bufio.NewReader(os.Stdin)
+		confirmation, err := prompt(reader, "Type DELETE to confirm", "")
+		if err != nil {
+			return err
+		}
+		if confirmation != "DELETE" {
+			return errors.New("delete cancelled")
+		}
+	}
+	account, err := resolveAccount(cfg, sess, api, accountHint)
+	if err != nil {
+		return err
+	}
+	if err := api.DeleteVM(account.UUID, vmName); err != nil {
+		return handleClientError(cfg.BaseURL, err)
+	}
+	_, err = fmt.Fprintf(w, "Deleted VM %s\n", vmName)
+	return err
+}
+
 func handlePowerAction(w io.Writer, cfg config.Config, sess session.State, api *client.Client, accountHint string, args []string, action string) error {
 	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
 		return fmt.Errorf("%s requires a VM name", action)
@@ -559,16 +659,83 @@ func handleSSH(cfg config.Config, sess session.State, api *client.Client, accoun
 	return client.RunSSH(resolution, username)
 }
 
-func handlePort(w io.Writer, args []string) error {
+func handlePort(w io.Writer, cfg config.Config, sess session.State, api *client.Client, accountHint string, args []string) error {
 	if len(args) == 0 {
 		return errors.New("port requires a subcommand")
 	}
 	switch args[0] {
-	case "add", "remove", "list":
-		return printPlaceholder(w, "port "+args[0])
+	case "add":
+		return handlePortAdd(w, cfg, sess, api, accountHint, args[1:])
+	case "remove":
+		return handlePortRemove(w, cfg, sess, api, accountHint, args[1:])
+	case "list":
+		return handlePortList(w, cfg, sess, api, accountHint, args[1:])
 	default:
 		return fmt.Errorf("unknown port subcommand %q", args[0])
 	}
+}
+
+func handlePortAdd(w io.Writer, cfg config.Config, sess session.State, api *client.Client, accountHint string, args []string) error {
+	if len(args) < 2 {
+		return errors.New("port add requires a VM name and public:guest mapping")
+	}
+	account, err := resolveAccount(cfg, sess, api, accountHint)
+	if err != nil {
+		return err
+	}
+	publicPort, guestPort, err := parsePortMapping(args[1])
+	if err != nil {
+		return err
+	}
+	port, err := api.AddPublishedPort(account.UUID, args[0], publicPort, guestPort)
+	if err != nil {
+		return handleClientError(cfg.BaseURL, err)
+	}
+	_, err = fmt.Fprintf(w, "Published %d -> %d (%s)\n", port.PublicPort, port.GuestPort, port.Protocol)
+	return err
+}
+
+func handlePortRemove(w io.Writer, cfg config.Config, sess session.State, api *client.Client, accountHint string, args []string) error {
+	if len(args) < 2 {
+		return errors.New("port remove requires a VM name and public port")
+	}
+	account, err := resolveAccount(cfg, sess, api, accountHint)
+	if err != nil {
+		return err
+	}
+	publicPort, err := strconv.Atoi(strings.TrimSpace(args[1]))
+	if err != nil {
+		return errors.New("public port must be numeric")
+	}
+	if err := api.RemovePublishedPort(account.UUID, args[0], publicPort); err != nil {
+		return handleClientError(cfg.BaseURL, err)
+	}
+	_, err = fmt.Fprintf(w, "Removed published port %d from %s\n", publicPort, args[0])
+	return err
+}
+
+func handlePortList(w io.Writer, cfg config.Config, sess session.State, api *client.Client, accountHint string, args []string) error {
+	if len(args) == 0 {
+		return errors.New("port list requires a VM name")
+	}
+	account, err := resolveAccount(cfg, sess, api, accountHint)
+	if err != nil {
+		return err
+	}
+	ports, err := api.ListPublishedPorts(account.UUID, args[0])
+	if err != nil {
+		return handleClientError(cfg.BaseURL, err)
+	}
+	if len(ports) == 0 {
+		_, err := fmt.Fprintf(w, "No published ports for %s\n", args[0])
+		return err
+	}
+	for _, port := range ports {
+		if _, err := fmt.Fprintf(w, "%d\t%d\t%s\n", port.PublicPort, port.GuestPort, port.Protocol); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func finalizeAuthResult(w io.Writer, cfg *config.Config, api *client.Client, result client.AuthResult) error {
@@ -729,6 +896,62 @@ func parseSSHVMTarget(value string) (username string, vmName string) {
 		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
 	}
 	return "", value
+}
+
+func parsePortMapping(value string) (int, int, error) {
+	parts := strings.Split(strings.TrimSpace(value), ":")
+	if len(parts) != 2 {
+		return 0, 0, errors.New("port mapping must be in public:guest format")
+	}
+	publicPort, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return 0, 0, errors.New("public port must be numeric")
+	}
+	guestPort, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return 0, 0, errors.New("guest port must be numeric")
+	}
+	return publicPort, guestPort, nil
+}
+
+func resolveTemplate(templates []client.Template, identifier string) (client.Template, error) {
+	identifier = strings.TrimSpace(identifier)
+	for _, template := range templates {
+		if template.UUID == identifier || strings.EqualFold(template.Name, identifier) {
+			return template, nil
+		}
+	}
+	return client.Template{}, fmt.Errorf("template %q not found", identifier)
+}
+
+func firstArg(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
+func secondArg(values []string) string {
+	if len(values) < 2 {
+		return ""
+	}
+	return values[1]
+}
+
+func thirdArg(values []string) string {
+	if len(values) < 3 {
+		return ""
+	}
+	return values[2]
+}
+
+func hasFlag(values []string, target string) bool {
+	for _, value := range values {
+		if strings.TrimSpace(value) == target {
+			return true
+		}
+	}
+	return false
 }
 
 func printPlaceholder(w io.Writer, area string) error {

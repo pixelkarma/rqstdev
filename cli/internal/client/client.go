@@ -41,6 +41,13 @@ type Invite struct {
 	CreatedAt   string `json:"createdAt"`
 }
 
+type Template struct {
+	UUID            string `json:"uuid"`
+	Name            string `json:"name"`
+	DefaultCPU      int    `json:"defaultCPU"`
+	DefaultMemoryMB int    `json:"defaultMemoryMB"`
+}
+
 type VM struct {
 	UUID         string `json:"uuid"`
 	Name         string `json:"name"`
@@ -51,6 +58,12 @@ type VM struct {
 	SSHReady     bool   `json:"sshReady"`
 	WebReady     bool   `json:"webReady"`
 	LastError    string `json:"lastError,omitempty"`
+}
+
+type PublishedPort struct {
+	PublicPort int    `json:"publicPort"`
+	GuestPort  int    `json:"guestPort"`
+	Protocol   string `json:"protocol"`
 }
 
 type SSHResolution struct {
@@ -237,6 +250,17 @@ func (c *Client) TransferAccount(accountUUID, email string) error {
 	return c.doJSON(http.MethodPost, path, map[string]string{"email": email}, nil)
 }
 
+func (c *Client) ListTemplates(accountUUID string) ([]Template, error) {
+	var resp struct {
+		Templates []Template `json:"templates"`
+	}
+	path := fmt.Sprintf("/v1/accounts/%s/templates", url.PathEscape(strings.TrimSpace(accountUUID)))
+	if err := c.doJSON(http.MethodGet, path, nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Templates, nil
+}
+
 func (c *Client) ListVMs(accountUUID string) ([]VM, error) {
 	var resp struct {
 		VMs []VM `json:"vms"`
@@ -248,6 +272,27 @@ func (c *Client) ListVMs(accountUUID string) ([]VM, error) {
 	return resp.VMs, nil
 }
 
+func (c *Client) CreateVM(accountUUID, name, templateUUID string, guestWebPort int) (VM, error) {
+	var resp struct {
+		VM VM `json:"vm"`
+	}
+	path := fmt.Sprintf("/v1/accounts/%s/vms", url.PathEscape(strings.TrimSpace(accountUUID)))
+	req := map[string]any{
+		"name":         name,
+		"templateUUID": templateUUID,
+		"guestWebPort": guestWebPort,
+	}
+	if err := c.doJSON(http.MethodPost, path, req, &resp); err != nil {
+		return VM{}, err
+	}
+	return resp.VM, nil
+}
+
+func (c *Client) DeleteVM(accountUUID, vmName string) error {
+	path := fmt.Sprintf("/v1/accounts/%s/vms/%s", url.PathEscape(strings.TrimSpace(accountUUID)), url.PathEscape(strings.TrimSpace(vmName)))
+	return c.doJSON(http.MethodDelete, path, nil, nil)
+}
+
 func (c *Client) ResolveVM(accountUUID, vmName string) (SSHResolution, error) {
 	var resp SSHResolution
 	path := fmt.Sprintf("/v1/accounts/%s/resolve-vm/%s", url.PathEscape(strings.TrimSpace(accountUUID)), url.PathEscape(strings.TrimSpace(vmName)))
@@ -255,6 +300,34 @@ func (c *Client) ResolveVM(accountUUID, vmName string) (SSHResolution, error) {
 		return SSHResolution{}, err
 	}
 	return resp, nil
+}
+
+func (c *Client) ListPublishedPorts(accountUUID, vmName string) ([]PublishedPort, error) {
+	var resp struct {
+		Ports []PublishedPort `json:"ports"`
+	}
+	path := fmt.Sprintf("/v1/accounts/%s/vms/%s/ports", url.PathEscape(strings.TrimSpace(accountUUID)), url.PathEscape(strings.TrimSpace(vmName)))
+	if err := c.doJSON(http.MethodGet, path, nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Ports, nil
+}
+
+func (c *Client) AddPublishedPort(accountUUID, vmName string, publicPort, guestPort int) (PublishedPort, error) {
+	var resp struct {
+		Port PublishedPort `json:"port"`
+	}
+	path := fmt.Sprintf("/v1/accounts/%s/vms/%s/ports", url.PathEscape(strings.TrimSpace(accountUUID)), url.PathEscape(strings.TrimSpace(vmName)))
+	req := map[string]int{"publicPort": publicPort, "guestPort": guestPort}
+	if err := c.doJSON(http.MethodPost, path, req, &resp); err != nil {
+		return PublishedPort{}, err
+	}
+	return resp.Port, nil
+}
+
+func (c *Client) RemovePublishedPort(accountUUID, vmName string, publicPort int) error {
+	path := fmt.Sprintf("/v1/accounts/%s/vms/%s/ports/%d", url.PathEscape(strings.TrimSpace(accountUUID)), url.PathEscape(strings.TrimSpace(vmName)), publicPort)
+	return c.doJSON(http.MethodDelete, path, nil, nil)
 }
 
 func (c *Client) PoweroffVM(accountUUID, vmName string) (VM, error) {

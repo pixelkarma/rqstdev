@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,6 +74,11 @@ type createVMRequest struct {
 	Name         string `json:"name"`
 	TemplateUUID string `json:"templateUUID"`
 	GuestWebPort int    `json:"guestWebPort"`
+}
+
+type createPortRequest struct {
+	PublicPort int `json:"publicPort"`
+	GuestPort  int `json:"guestPort"`
 }
 
 type inviteRequest struct {
@@ -735,12 +741,20 @@ func (h authHandler) handleVMSubroutes(w http.ResponseWriter, r *http.Request, s
 	switch {
 	case action == "" && r.Method == http.MethodGet:
 		h.handleVMGet(w, r, scope, vmName)
+	case action == "" && r.Method == http.MethodDelete:
+		h.handleVMDelete(w, r, scope, vmName)
 	case action == "/poweroff" && r.Method == http.MethodPost:
 		h.handleVMPoweroff(w, r, scope, vmName)
 	case action == "/kill" && r.Method == http.MethodPost:
 		h.handleVMKill(w, r, scope, vmName)
 	case action == "/poweron" && r.Method == http.MethodPost:
 		h.handleVMPoweron(w, r, scope, vmName)
+	case action == "/ports" && r.Method == http.MethodGet:
+		h.handleVMPortsList(w, r, scope, vmName)
+	case action == "/ports" && r.Method == http.MethodPost:
+		h.handleVMPortAdd(w, r, scope, vmName)
+	case strings.HasPrefix(action, "/ports/") && r.Method == http.MethodDelete:
+		h.handleVMPortRemove(w, r, scope, vmName, strings.TrimPrefix(action, "/ports/"))
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "Route not found.")
 	}
@@ -758,6 +772,22 @@ func (h authHandler) handleVMGet(w http.ResponseWriter, r *http.Request, scope s
 	}
 	h.refreshVMObservation(&vm)
 	writeJSON(w, http.StatusOK, map[string]any{"vm": vm})
+}
+
+func (h authHandler) handleVMDelete(w http.ResponseWriter, r *http.Request, scope store.AccountScope, vmName string) {
+	if scope.Role != "owner" && scope.Role != "admin" {
+		writeError(w, http.StatusForbidden, "forbidden", "Only admins and owners can delete VMs.")
+		return
+	}
+	vm, ok := h.loadVMForAction(w, r, scope, vmName)
+	if !ok {
+		return
+	}
+	if err := h.cleanupVM(r.Context(), vm); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to delete VM.")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (h authHandler) handleVMResolve(w http.ResponseWriter, r *http.Request, scope store.AccountScope, vmName string) {
@@ -791,6 +821,7 @@ func (h authHandler) handleVMPoweroff(w http.ResponseWriter, r *http.Request, sc
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to power off VM.")
 		return
 	}
+	_ = h.stopPublishedPorts(vm)
 	if h.vmrt.WaitForSSHClosed(vm.HostSSHPort, 30*time.Second) {
 		if err := h.store.UpdateVMState(r.Context(), vm.ID, "stopped", ""); err != nil {
 			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to update VM state.")
@@ -819,6 +850,7 @@ func (h authHandler) handleVMKill(w http.ResponseWriter, r *http.Request, scope 
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to kill VM.")
 		return
 	}
+	_ = h.stopPublishedPorts(vm)
 	if !h.vmrt.WaitForSSHClosed(vm.HostSSHPort, 10*time.Second) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "VM did not stop after kill.")
 		return
@@ -862,6 +894,94 @@ func (h authHandler) handleVMPoweron(w http.ResponseWriter, r *http.Request, sco
 	writeJSON(w, http.StatusOK, map[string]any{"vm": vm})
 }
 
+func (h authHandler) handleVMPortsList(w http.ResponseWriter, r *http.Request, scope store.AccountScope, vmName string) {
+	vm, ok := h.loadVMForAction(w, r, scope, vmName)
+	if !ok {
+		return
+	}
+	ports, err := h.store.PublishedPortsForVM(r.Context(), vm.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load published ports.")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ports": ports})
+}
+
+func (h authHandler) handleVMPortAdd(w http.ResponseWriter, r *http.Request, scope store.AccountScope, vmName string) {
+	if scope.Role != "owner" && scope.Role != "admin" {
+		writeError(w, http.StatusForbidden, "forbidden", "Only admins and owners can publish ports.")
+		return
+	}
+	vm, ok := h.loadVMForAction(w, r, scope, vmName)
+	if !ok {
+		return
+	}
+	var req createPortRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "validation_error", err.Error())
+		return
+	}
+	if req.PublicPort <= 0 || req.GuestPort <= 0 {
+		writeError(w, http.StatusBadRequest, "validation_error", "publicPort and guestPort are required")
+		return
+	}
+	port, err := h.store.AddPublishedPort(r.Context(), vm.ID, req.PublicPort, req.GuestPort)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrConflict):
+			writeError(w, http.StatusConflict, "conflict", "That public port is already in use.")
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to save published port.")
+		}
+		return
+	}
+	if vm.SSHReady {
+		if err := h.vmrt.StartPublishedPort(vm, port.PublicPort, port.GuestPort); err != nil {
+			_ = h.store.RemovePublishedPort(r.Context(), vm.ID, port.PublicPort)
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to publish port.")
+			return
+		}
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"port": port})
+}
+
+func (h authHandler) handleVMPortRemove(w http.ResponseWriter, r *http.Request, scope store.AccountScope, vmName, publicPortValue string) {
+	if scope.Role != "owner" && scope.Role != "admin" {
+		writeError(w, http.StatusForbidden, "forbidden", "Only admins and owners can remove published ports.")
+		return
+	}
+	vm, ok := h.loadVMForAction(w, r, scope, vmName)
+	if !ok {
+		return
+	}
+	publicPort, err := strconv.Atoi(strings.TrimSpace(publicPortValue))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "validation_error", "public port must be numeric")
+		return
+	}
+	ports, err := h.store.PublishedPortsForVM(r.Context(), vm.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load published ports.")
+		return
+	}
+	for _, port := range ports {
+		if port.PublicPort == publicPort {
+			_ = h.vmrt.StopPublishedPort(vm, port.PublicPort)
+			break
+		}
+	}
+	if err := h.store.RemovePublishedPort(r.Context(), vm.ID, publicPort); err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			writeError(w, http.StatusNotFound, "not_found", "Published port not found.")
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to remove published port.")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (h authHandler) loadVMForAction(w http.ResponseWriter, r *http.Request, scope store.AccountScope, vmName string) (store.VM, bool) {
 	if scope.Role != "owner" && scope.Role != "admin" && scope.Role != "user" {
 		writeError(w, http.StatusForbidden, "forbidden", "Account access denied.")
@@ -897,11 +1017,49 @@ func (h authHandler) monitorVMReadiness(vm store.VM) {
 				continue
 			}
 			webReady := h.vmrt.ProbeWebReady(vm.HostWebPort, 6*time.Second)
+			ports, _ := h.store.PublishedPortsForVM(context.Background(), vm.ID)
+			for _, port := range ports {
+				_ = h.vmrt.StartPublishedPort(vm, port.PublicPort, port.GuestPort)
+			}
 			_ = h.store.UpdateVMReadiness(context.Background(), vm.ID, true, webReady)
 			_ = h.store.UpdateVMState(context.Background(), vm.ID, "running", "")
 			return
 		}
 	}
+}
+
+func (h authHandler) stopPublishedPorts(vm store.VM) error {
+	ports, err := h.store.PublishedPortsForVM(context.Background(), vm.ID)
+	if err != nil {
+		return err
+	}
+	for _, port := range ports {
+		if err := h.vmrt.StopPublishedPort(vm, port.PublicPort); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h authHandler) cleanupVM(ctx context.Context, vm store.VM) error {
+	_ = h.stopPublishedPorts(vm)
+	if h.vmrt.IsVMRunning(vm) {
+		_ = h.vmrt.KillVM(vm)
+		_ = h.vmrt.WaitForSSHClosed(vm.HostSSHPort, 10*time.Second)
+	}
+	if err := h.vmrt.RemoveNginxSnippet(vm.Name); err != nil {
+		return err
+	}
+	if err := h.vmrt.ReloadNginx(); err != nil {
+		return err
+	}
+	if err := h.vmrt.RemoveRuntimeDir(vm.RuntimeDir); err != nil {
+		return err
+	}
+	if err := h.store.DeleteVM(ctx, vm.ID); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (h authHandler) refreshVMObservation(vm *store.VM) {

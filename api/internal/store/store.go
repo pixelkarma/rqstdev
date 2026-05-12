@@ -96,6 +96,13 @@ type VM struct {
 	SerialLogPath string `json:"-"`
 }
 
+type PublishedPort struct {
+	ID         int64  `json:"-"`
+	PublicPort int    `json:"publicPort"`
+	GuestPort  int    `json:"guestPort"`
+	Protocol   string `json:"protocol"`
+}
+
 type SignupParams struct {
 	Email       string
 	Password    string
@@ -1158,6 +1165,13 @@ func (s *Store) UpdateVMReadiness(ctx context.Context, vmID int64, sshReady, web
 	return nil
 }
 
+func (s *Store) DeleteVM(ctx context.Context, vmID int64) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM vms WHERE id = ?`, vmID); err != nil {
+		return fmt.Errorf("delete vm: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) VMsForAccount(ctx context.Context, accountID int64, accountUUID string) ([]VM, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, uuid, name, state, ssh_ready, web_ready, guest_web_port, COALESCE(last_error, '')
@@ -1230,6 +1244,69 @@ func (s *Store) VMForAccountByName(ctx context.Context, accountID int64, account
 	vm.HostSSHPort = HostSSHPort(vm.ID)
 	vm.HostWebPort = HostWebPort(vm.ID)
 	return vm, nil
+}
+
+func (s *Store) PublishedPortsForVM(ctx context.Context, vmID int64) ([]PublishedPort, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, public_port, guest_port, protocol
+		FROM published_ports
+		WHERE vm_id = ?
+		ORDER BY public_port ASC
+	`, vmID)
+	if err != nil {
+		return nil, fmt.Errorf("query published ports: %w", err)
+	}
+	defer rows.Close()
+
+	var ports []PublishedPort
+	for rows.Next() {
+		var port PublishedPort
+		if err := rows.Scan(&port.ID, &port.PublicPort, &port.GuestPort, &port.Protocol); err != nil {
+			return nil, fmt.Errorf("scan published port: %w", err)
+		}
+		ports = append(ports, port)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate published ports: %w", err)
+	}
+	return ports, nil
+}
+
+func (s *Store) AddPublishedPort(ctx context.Context, vmID int64, publicPort, guestPort int) (PublishedPort, error) {
+	now := utcNow()
+	result, err := s.db.ExecContext(ctx, `
+		INSERT INTO published_ports (vm_id, public_port, guest_port, protocol, created_at)
+		VALUES (?, ?, ?, 'tcp', ?)
+	`, vmID, publicPort, guestPort, now)
+	if err != nil {
+		if isConstraintErr(err) {
+			return PublishedPort{}, ErrConflict
+		}
+		return PublishedPort{}, fmt.Errorf("insert published port: %w", err)
+	}
+	portID, err := result.LastInsertId()
+	if err != nil {
+		return PublishedPort{}, fmt.Errorf("read published port id: %w", err)
+	}
+	return PublishedPort{ID: portID, PublicPort: publicPort, GuestPort: guestPort, Protocol: "tcp"}, nil
+}
+
+func (s *Store) RemovePublishedPort(ctx context.Context, vmID int64, publicPort int) error {
+	result, err := s.db.ExecContext(ctx, `
+		DELETE FROM published_ports
+		WHERE vm_id = ? AND public_port = ?
+	`, vmID, publicPort)
+	if err != nil {
+		return fmt.Errorf("delete published port: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read deleted published port rows: %w", err)
+	}
+	if rows == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (s *Store) respondInvite(ctx context.Context, userID int64, inviteUUID, status string) error {

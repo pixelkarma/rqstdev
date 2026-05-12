@@ -193,6 +193,51 @@ func (rt Runtime) NginxSnippetPath(vmName string) string {
 	return filepath.Join(rt.NginxSnippetDir, "rqstdev-"+vmName+".conf")
 }
 
+func (rt Runtime) RemoveNginxSnippet(vmName string) error {
+	if err := os.Remove(rt.NginxSnippetPath(vmName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove nginx snippet: %w", err)
+	}
+	return nil
+}
+
+func (rt Runtime) RemoveRuntimeDir(runtimeDir string) error {
+	if err := os.RemoveAll(runtimeDir); err != nil {
+		return fmt.Errorf("remove runtime dir: %w", err)
+	}
+	return nil
+}
+
+func (rt Runtime) IsVMRunning(vm store.VM) bool {
+	pid, err := readPID(vm.PIDFilePath)
+	if err != nil {
+		return false
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return process.Signal(syscall.Signal(0)) == nil
+}
+
+func (rt Runtime) StartPublishedPort(vm store.VM, publicPort, guestPort int) error {
+	command := fmt.Sprintf("hostfwd_add tcp::%d-:%d", publicPort, guestPort)
+	if err := qmpHumanMonitorCommand(vm.QMPSocketPath, command); err != nil {
+		return fmt.Errorf("add host forward: %w", err)
+	}
+	return nil
+}
+
+func (rt Runtime) StopPublishedPort(vm store.VM, publicPort int) error {
+	command := fmt.Sprintf("hostfwd_remove tcp::%d", publicPort)
+	if err := qmpHumanMonitorCommand(vm.QMPSocketPath, command); err != nil {
+		if strings.Contains(err.Error(), "Could not find rule") {
+			return nil
+		}
+		return fmt.Errorf("remove host forward: %w", err)
+	}
+	return nil
+}
+
 func (rt Runtime) WriteNginxSnippet(vm store.VM) error {
 	if err := os.MkdirAll(rt.NginxSnippetDir, 0o755); err != nil {
 		return fmt.Errorf("create nginx snippet dir: %w", err)
@@ -311,6 +356,43 @@ func readQMPReply(reader *bufio.Reader, execute string) error {
 			return nil
 		}
 	}
+}
+
+func qmpHumanMonitorCommand(socketPath, command string) error {
+	conn, err := net.DialTimeout("unix", socketPath, 3*time.Second)
+	if err != nil {
+		return fmt.Errorf("connect qmp socket: %w", err)
+	}
+	defer conn.Close()
+
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return fmt.Errorf("set qmp deadline: %w", err)
+	}
+
+	reader := bufio.NewReader(conn)
+	if _, err := reader.ReadBytes('\n'); err != nil {
+		return fmt.Errorf("read qmp greeting: %w", err)
+	}
+	if err := writeQMPCommand(conn, "qmp_capabilities"); err != nil {
+		return err
+	}
+	if err := readQMPReply(reader, "qmp_capabilities"); err != nil {
+		return err
+	}
+
+	payload := map[string]any{
+		"execute": "human-monitor-command",
+		"arguments": map[string]any{
+			"command-line": command,
+		},
+	}
+	if err := json.NewEncoder(conn).Encode(payload); err != nil {
+		return fmt.Errorf("write qmp human-monitor-command: %w", err)
+	}
+	if err := readQMPReply(reader, "human-monitor-command"); err != nil {
+		return err
+	}
+	return nil
 }
 
 func readPID(path string) (int, error) {
