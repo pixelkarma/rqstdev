@@ -75,27 +75,28 @@ func (rt Runtime) StartVM(vm store.VM, files Files, cpuCount, memoryMB int) erro
 	_ = os.Remove(files.PIDFilePath)
 	_ = os.Remove(files.QMPSocketPath)
 
-	netdev := fmt.Sprintf(
-		"user,id=net0,hostfwd=tcp:127.0.0.1:%d-:22,hostfwd=tcp:127.0.0.1:%d-:%d",
+	nic := fmt.Sprintf(
+		"user,hostfwd=tcp:127.0.0.1:%d-:22,hostfwd=tcp:127.0.0.1:%d-:%d",
 		vm.HostSSHPort,
 		vm.HostWebPort,
 		vm.GuestWebPort,
 	)
 
 	args := []string{
-		"-name", "rqstdev-" + vm.Name,
-		"-machine", "accel=kvm:tcg",
-		"-cpu", "host",
-		"-m", strconv.Itoa(memoryMB),
-		"-smp", strconv.Itoa(cpuCount),
+		"-m", strconv.Itoa(memoryMB) + "M",
+		"-drive", "file=" + files.DiskImagePath + ",format=qcow2",
+		"-nic", nic,
+		"-boot", "d",
 		"-qmp", "unix:" + files.QMPSocketPath + ",server,nowait",
-		"-drive", "file=" + files.DiskImagePath + ",format=qcow2,if=virtio",
-		"-netdev", netdev,
-		"-device", "virtio-net-pci,netdev=net0",
 		"-pidfile", files.PIDFilePath,
+		"-monitor", "none",
 		"-serial", "file:" + files.SerialLogPath,
 		"-display", "none",
 		"-daemonize",
+	}
+
+	if cpuCount > 1 {
+		args = append([]string{"-smp", strconv.Itoa(cpuCount)}, args...)
 	}
 
 	cmd := exec.Command(rt.QEMUBinaryPath, args...)
