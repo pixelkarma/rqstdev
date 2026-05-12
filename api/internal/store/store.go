@@ -43,6 +43,21 @@ type AccountMembership struct {
 	Role        string `json:"role"`
 }
 
+type AccountMember struct {
+	UserUUID string `json:"userUUID"`
+	Email    string `json:"email"`
+	Role     string `json:"role"`
+}
+
+type Invite struct {
+	UUID        string `json:"uuid"`
+	AccountUUID string `json:"accountUUID"`
+	AccountName string `json:"accountName"`
+	Role        string `json:"role"`
+	Status      string `json:"status"`
+	CreatedAt   string `json:"createdAt"`
+}
+
 type AccountScope struct {
 	AccountID   int64
 	AccountUUID string
@@ -377,6 +392,72 @@ func (s *Store) CreateUserWithAccount(ctx context.Context, params SignupParams) 
 	return User{ID: userID, UUID: userUUID, Email: email}, token, nil
 }
 
+func (s *Store) CreateUserWithAccountNoSession(ctx context.Context, params SignupParams) (User, error) {
+	email := normalizeEmail(params.Email)
+	password := strings.TrimSpace(params.Password)
+	accountName := strings.TrimSpace(params.AccountName)
+	if email == "" || password == "" || accountName == "" {
+		return User{}, fmt.Errorf("email, password, and accountName are required")
+	}
+
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return User{}, fmt.Errorf("hash password: %w", err)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return User{}, fmt.Errorf("begin signup tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	now := utcNow()
+	userUUID := newUUIDLike()
+	accountUUID := newUUIDLike()
+
+	userResult, err := tx.ExecContext(ctx, `
+		INSERT INTO users (uuid, email, password_hash, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, userUUID, email, string(passwordHash), now, now)
+	if err != nil {
+		if isConstraintErr(err) {
+			return User{}, ErrConflict
+		}
+		return User{}, fmt.Errorf("insert user: %w", err)
+	}
+
+	userID, err := userResult.LastInsertId()
+	if err != nil {
+		return User{}, fmt.Errorf("read user id: %w", err)
+	}
+
+	accountResult, err := tx.ExecContext(ctx, `
+		INSERT INTO accounts (uuid, name, created_at, updated_at)
+		VALUES (?, ?, ?, ?)
+	`, accountUUID, accountName, now, now)
+	if err != nil {
+		return User{}, fmt.Errorf("insert account: %w", err)
+	}
+
+	accountID, err := accountResult.LastInsertId()
+	if err != nil {
+		return User{}, fmt.Errorf("read account id: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO account_users (account_id, user_id, role, created_at, updated_at)
+		VALUES (?, ?, 'owner', ?, ?)
+	`, accountID, userID, now, now); err != nil {
+		return User{}, fmt.Errorf("insert account owner: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return User{}, fmt.Errorf("commit signup tx: %w", err)
+	}
+
+	return User{ID: userID, UUID: userUUID, Email: email}, nil
+}
+
 func (s *Store) Authenticate(ctx context.Context, email, password string) (User, error) {
 	var user User
 	var passwordHash string
@@ -396,6 +477,22 @@ func (s *Store) Authenticate(ctx context.Context, email, password string) (User,
 
 	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(password)); err != nil {
 		return User{}, ErrInvalidCredentials
+	}
+	return user, nil
+}
+
+func (s *Store) UserByEmail(ctx context.Context, email string) (User, error) {
+	var user User
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, uuid, email
+		FROM users
+		WHERE email = ?
+	`, normalizeEmail(email))
+	if err := row.Scan(&user.ID, &user.UUID, &user.Email); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return User{}, ErrNotFound
+		}
+		return User{}, fmt.Errorf("lookup user by email: %w", err)
 	}
 	return user, nil
 }
@@ -460,6 +557,125 @@ func (s *Store) RevokeToken(ctx context.Context, token string) error {
 	}
 	if rows == 0 {
 		return ErrTokenInvalid
+	}
+	return nil
+}
+
+func (s *Store) RevokeAllTokensForUser(ctx context.Context, userID int64) error {
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE session_tokens
+		SET revoked_at = ?
+		WHERE user_id = ? AND revoked_at IS NULL
+	`, utcNow(), userID); err != nil {
+		return fmt.Errorf("revoke all tokens: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) CreateAuthAttempt(ctx context.Context, userID int64, purpose string) (string, error) {
+	if purpose != "login" && purpose != "reset" {
+		return "", fmt.Errorf("invalid auth attempt purpose")
+	}
+	if err := s.cleanupAuthAttempts(ctx, userID, purpose); err != nil {
+		return "", err
+	}
+
+	code, err := newNumericCode(6)
+	if err != nil {
+		return "", err
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO auth_attempts (user_id, purpose, code_hash, created_at, used_at)
+		VALUES (?, ?, ?, ?, NULL)
+	`, userID, purpose, hashToken(code), utcNow()); err != nil {
+		return "", fmt.Errorf("insert auth attempt: %w", err)
+	}
+	return code, nil
+}
+
+func (s *Store) VerifyAuthAttempt(ctx context.Context, email, purpose, code string) (User, error) {
+	user, err := s.UserByEmail(ctx, email)
+	if err != nil {
+		return User{}, err
+	}
+	if err := s.cleanupAuthAttempts(ctx, user.ID, purpose); err != nil {
+		return User{}, err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return User{}, fmt.Errorf("begin auth verify tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var attemptID int64
+	var codeHash string
+	row := tx.QueryRowContext(ctx, `
+		SELECT id, code_hash
+		FROM auth_attempts
+		WHERE user_id = ? AND purpose = ? AND used_at IS NULL
+		  AND created_at >= ?
+		ORDER BY created_at DESC, id DESC
+		LIMIT 1
+	`, user.ID, purpose, cutoffRFC3339(time.Hour))
+	if err := row.Scan(&attemptID, &codeHash); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return User{}, ErrInvalidCredentials
+		}
+		return User{}, fmt.Errorf("lookup auth attempt: %w", err)
+	}
+	if codeHash != hashToken(strings.TrimSpace(code)) {
+		return User{}, ErrInvalidCredentials
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE auth_attempts
+		SET used_at = ?
+		WHERE id = ?
+	`, utcNow(), attemptID); err != nil {
+		return User{}, fmt.Errorf("mark auth attempt used: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM auth_attempts
+		WHERE user_id = ? AND purpose = ? AND (used_at IS NOT NULL OR created_at < ?)
+	`, user.ID, purpose, cutoffRFC3339(time.Hour)); err != nil {
+		return User{}, fmt.Errorf("cleanup auth attempts after verify: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return User{}, fmt.Errorf("commit auth verify tx: %w", err)
+	}
+	return user, nil
+}
+
+func (s *Store) ResetPasswordWithCode(ctx context.Context, email, code, newPassword string) error {
+	user, err := s.VerifyAuthAttempt(ctx, email, "reset", code)
+	if err != nil {
+		return err
+	}
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(strings.TrimSpace(newPassword)), bcrypt.DefaultCost)
+	if err != nil {
+		return fmt.Errorf("hash password: %w", err)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin password reset tx: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE users
+		SET password_hash = ?, updated_at = ?
+		WHERE id = ?
+	`, string(passwordHash), utcNow(), user.ID); err != nil {
+		return fmt.Errorf("update password: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE session_tokens
+		SET revoked_at = ?
+		WHERE user_id = ? AND revoked_at IS NULL
+	`, utcNow(), user.ID); err != nil {
+		return fmt.Errorf("revoke sessions after password reset: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit password reset tx: %w", err)
 	}
 	return nil
 }
@@ -552,6 +768,246 @@ func (s *Store) AccountScopeForUser(ctx context.Context, userID int64, accountUU
 		return AccountScope{}, fmt.Errorf("lookup account scope: %w", err)
 	}
 	return scope, nil
+}
+
+func (s *Store) AccountMembers(ctx context.Context, accountID int64) ([]AccountMember, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT u.uuid, u.email, au.role
+		FROM account_users au
+		JOIN users u ON u.id = au.user_id
+		WHERE au.account_id = ?
+		ORDER BY
+			CASE au.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
+			u.email ASC
+	`, accountID)
+	if err != nil {
+		return nil, fmt.Errorf("query account members: %w", err)
+	}
+	defer rows.Close()
+
+	var members []AccountMember
+	for rows.Next() {
+		var member AccountMember
+		if err := rows.Scan(&member.UserUUID, &member.Email, &member.Role); err != nil {
+			return nil, fmt.Errorf("scan account member: %w", err)
+		}
+		members = append(members, member)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate account members: %w", err)
+	}
+	return members, nil
+}
+
+func (s *Store) CreateInvite(ctx context.Context, accountID int64, email, role string) (Invite, error) {
+	if role != "admin" && role != "user" {
+		return Invite{}, fmt.Errorf("invalid invite role")
+	}
+	user, err := s.UserByEmail(ctx, email)
+	if err != nil {
+		return Invite{}, err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Invite{}, fmt.Errorf("begin invite tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var accountUUID, accountName string
+	row := tx.QueryRowContext(ctx, `SELECT uuid, name FROM accounts WHERE id = ?`, accountID)
+	if err := row.Scan(&accountUUID, &accountName); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Invite{}, ErrNotFound
+		}
+		return Invite{}, fmt.Errorf("lookup account for invite: %w", err)
+	}
+
+	var membershipCount int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(1)
+		FROM account_users
+		WHERE account_id = ? AND user_id = ?
+	`, accountID, user.ID).Scan(&membershipCount); err != nil {
+		return Invite{}, fmt.Errorf("check existing membership: %w", err)
+	}
+	if membershipCount > 0 {
+		return Invite{}, ErrConflict
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE account_invites
+		SET status = 'revoked', responded_at = ?
+		WHERE account_id = ? AND user_id = ? AND status = 'pending'
+	`, utcNow(), accountID, user.ID); err != nil {
+		return Invite{}, fmt.Errorf("revoke prior invites: %w", err)
+	}
+
+	invite := Invite{
+		UUID:        newUUIDLike(),
+		AccountUUID: accountUUID,
+		AccountName: accountName,
+		Role:        role,
+		Status:      "pending",
+		CreatedAt:   utcNow(),
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO account_invites (uuid, account_id, user_id, role, status, created_at, responded_at)
+		VALUES (?, ?, ?, ?, 'pending', ?, NULL)
+	`, invite.UUID, accountID, user.ID, role, invite.CreatedAt); err != nil {
+		if isConstraintErr(err) {
+			return Invite{}, ErrConflict
+		}
+		return Invite{}, fmt.Errorf("insert invite: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return Invite{}, fmt.Errorf("commit invite tx: %w", err)
+	}
+	return invite, nil
+}
+
+func (s *Store) InvitesForUser(ctx context.Context, userID int64) ([]Invite, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT ai.uuid, a.uuid, a.name, ai.role, ai.status, ai.created_at
+		FROM account_invites ai
+		JOIN accounts a ON a.id = ai.account_id
+		WHERE ai.user_id = ? AND ai.status = 'pending'
+		ORDER BY ai.created_at ASC, ai.id ASC
+	`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("query invites: %w", err)
+	}
+	defer rows.Close()
+
+	var invites []Invite
+	for rows.Next() {
+		var invite Invite
+		if err := rows.Scan(&invite.UUID, &invite.AccountUUID, &invite.AccountName, &invite.Role, &invite.Status, &invite.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan invite: %w", err)
+		}
+		invites = append(invites, invite)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate invites: %w", err)
+	}
+	return invites, nil
+}
+
+func (s *Store) AcceptInvite(ctx context.Context, userID int64, inviteUUID string) error {
+	return s.respondInvite(ctx, userID, inviteUUID, "accepted")
+}
+
+func (s *Store) RefuseInvite(ctx context.Context, userID int64, inviteUUID string) error {
+	return s.respondInvite(ctx, userID, inviteUUID, "refused")
+}
+
+func (s *Store) RevokeAccountUser(ctx context.Context, accountID, actorUserID int64, actorRole, targetUserUUID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin revoke tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var targetUserID int64
+	var targetRole string
+	row := tx.QueryRowContext(ctx, `
+		SELECT u.id, au.role
+		FROM account_users au
+		JOIN users u ON u.id = au.user_id
+		WHERE au.account_id = ? AND u.uuid = ?
+	`, accountID, targetUserUUID)
+	if err := row.Scan(&targetUserID, &targetRole); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("lookup revoke target: %w", err)
+	}
+
+	if targetRole == "owner" {
+		return ErrConflict
+	}
+	if actorUserID == targetUserID {
+		return ErrConflict
+	}
+	if actorRole != "owner" && actorRole != "admin" {
+		return ErrAuthRequired
+	}
+	if actorRole == "admin" && targetRole == "admin" {
+		return ErrConflict
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM account_users
+		WHERE account_id = ? AND user_id = ?
+	`, accountID, targetUserID); err != nil {
+		return fmt.Errorf("delete account membership: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit revoke tx: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) TransferAccountOwnership(ctx context.Context, accountID, actorUserID int64, targetEmail string) error {
+	targetEmail = normalizeEmail(targetEmail)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transfer tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var currentOwnerID int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT user_id
+		FROM account_users
+		WHERE account_id = ? AND role = 'owner'
+		LIMIT 1
+	`, accountID).Scan(&currentOwnerID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("lookup current owner: %w", err)
+	}
+	if currentOwnerID != actorUserID {
+		return ErrAuthRequired
+	}
+
+	var targetUserID int64
+	var targetRole string
+	row := tx.QueryRowContext(ctx, `
+		SELECT u.id, au.role
+		FROM account_users au
+		JOIN users u ON u.id = au.user_id
+		WHERE au.account_id = ? AND u.email = ?
+	`, accountID, targetEmail)
+	if err := row.Scan(&targetUserID, &targetRole); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("lookup transfer target: %w", err)
+	}
+	if targetUserID == actorUserID {
+		return ErrConflict
+	}
+
+	now := utcNow()
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE account_users
+		SET role = 'admin', updated_at = ?
+		WHERE account_id = ? AND user_id = ?
+	`, now, accountID, actorUserID); err != nil {
+		return fmt.Errorf("demote owner: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE account_users
+		SET role = 'owner', updated_at = ?
+		WHERE account_id = ? AND user_id = ?
+	`, now, accountID, targetUserID); err != nil {
+		return fmt.Errorf("promote owner: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transfer tx: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) EnsureDefaultTemplate(ctx context.Context, name, imagePath string) error {
@@ -776,6 +1232,53 @@ func (s *Store) VMForAccountByName(ctx context.Context, accountID int64, account
 	return vm, nil
 }
 
+func (s *Store) respondInvite(ctx context.Context, userID int64, inviteUUID, status string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin invite response tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	var inviteID int64
+	var accountID int64
+	var role string
+	row := tx.QueryRowContext(ctx, `
+		SELECT id, account_id, role
+		FROM account_invites
+		WHERE uuid = ? AND user_id = ? AND status = 'pending'
+	`, inviteUUID, userID)
+	if err := row.Scan(&inviteID, &accountID, &role); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("lookup invite response: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE account_invites
+		SET status = ?, responded_at = ?
+		WHERE id = ?
+	`, status, utcNow(), inviteID); err != nil {
+		return fmt.Errorf("update invite status: %w", err)
+	}
+
+	if status == "accepted" {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO account_users (account_id, user_id, role, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?)
+		`, accountID, userID, role, utcNow(), utcNow()); err != nil {
+			if !isConstraintErr(err) {
+				return fmt.Errorf("insert accepted membership: %w", err)
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit invite response tx: %w", err)
+	}
+	return nil
+}
+
 func HostSSHPort(vmID int64) int {
 	return 22000 + int(vmID)
 }
@@ -817,6 +1320,16 @@ func hashToken(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func (s *Store) cleanupAuthAttempts(ctx context.Context, userID int64, purpose string) error {
+	if _, err := s.db.ExecContext(ctx, `
+		DELETE FROM auth_attempts
+		WHERE user_id = ? AND purpose = ? AND (used_at IS NOT NULL OR created_at < ?)
+	`, userID, purpose, cutoffRFC3339(time.Hour)); err != nil {
+		return fmt.Errorf("cleanup auth attempts: %w", err)
+	}
+	return nil
+}
+
 func isConstraintErr(err error) bool {
 	if err == nil {
 		return false
@@ -830,4 +1343,24 @@ func boolToInt(value bool) int {
 		return 1
 	}
 	return 0
+}
+
+func cutoffRFC3339(age time.Duration) string {
+	return time.Now().UTC().Add(-age).Format(time.RFC3339)
+}
+
+func newNumericCode(length int) (string, error) {
+	if length <= 0 {
+		return "", fmt.Errorf("invalid code length")
+	}
+	var builder strings.Builder
+	builder.Grow(length)
+	var raw [1]byte
+	for builder.Len() < length {
+		if _, err := rand.Read(raw[:]); err != nil {
+			return "", fmt.Errorf("generate code: %w", err)
+		}
+		builder.WriteByte('0' + (raw[0] % 10))
+	}
+	return builder.String(), nil
 }

@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -52,10 +53,35 @@ type createAccountRequest struct {
 	Name string `json:"name"`
 }
 
+type challengeVerifyRequest struct {
+	Email   string `json:"email"`
+	Purpose string `json:"purpose"`
+	Code    string `json:"code"`
+}
+
+type forgotRequest struct {
+	Email string `json:"email"`
+}
+
+type resetRequest struct {
+	Email       string `json:"email"`
+	Code        string `json:"code"`
+	NewPassword string `json:"newPassword"`
+}
+
 type createVMRequest struct {
 	Name         string `json:"name"`
 	TemplateUUID string `json:"templateUUID"`
 	GuestWebPort int    `json:"guestWebPort"`
+}
+
+type inviteRequest struct {
+	Email string `json:"email"`
+	Role  string `json:"role"`
+}
+
+type transferRequest struct {
+	Email string `json:"email"`
 }
 
 type sshResolveResponse struct {
@@ -124,15 +150,9 @@ func registerRoutes(mux *http.ServeMux, srv *Server) {
 	mux.HandleFunc("/v1/me", method(http.MethodGet, auth.handleMe))
 	mux.HandleFunc("/v1/auth/signup", method(http.MethodPost, auth.handleSignup))
 	mux.HandleFunc("/v1/auth/login", method(http.MethodPost, auth.handleLogin))
-	mux.HandleFunc("/v1/auth/challenge/verify", method(http.MethodPost, func(w http.ResponseWriter, r *http.Request) {
-		writeNotImplemented(w, "challenge_verify")
-	}))
-	mux.HandleFunc("/v1/auth/forgot", method(http.MethodPost, func(w http.ResponseWriter, r *http.Request) {
-		writeNotImplemented(w, "forgot")
-	}))
-	mux.HandleFunc("/v1/auth/reset", method(http.MethodPost, func(w http.ResponseWriter, r *http.Request) {
-		writeNotImplemented(w, "reset")
-	}))
+	mux.HandleFunc("/v1/auth/challenge/verify", method(http.MethodPost, auth.handleChallengeVerify))
+	mux.HandleFunc("/v1/auth/forgot", method(http.MethodPost, auth.handleForgot))
+	mux.HandleFunc("/v1/auth/reset", method(http.MethodPost, auth.handleReset))
 	mux.HandleFunc("/v1/auth/logout", method(http.MethodPost, auth.handleLogout))
 
 	mux.HandleFunc("/v1/accounts", func(w http.ResponseWriter, r *http.Request) {
@@ -147,9 +167,8 @@ func registerRoutes(mux *http.ServeMux, srv *Server) {
 	})
 	mux.HandleFunc("/v1/accounts/", auth.handleAccountSubroutes)
 
-	mux.HandleFunc("/v1/invites", method(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
-		writeNotImplemented(w, "invites_list")
-	}))
+	mux.HandleFunc("/v1/invites", method(http.MethodGet, auth.handleInvitesList))
+	mux.HandleFunc("/v1/invites/", auth.handleInviteSubroutes)
 
 	mux.HandleFunc("/v1/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "Route not found.")
@@ -157,14 +176,34 @@ func registerRoutes(mux *http.ServeMux, srv *Server) {
 }
 
 func (h authHandler) handleSignup(w http.ResponseWriter, r *http.Request) {
-	if strings.TrimSpace(h.cfg.EmailScriptPath) != "" {
-		writeError(w, http.StatusNotImplemented, "two_factor_required", "Email challenge flow is not implemented yet.")
-		return
-	}
-
 	var req signupRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "validation_error", err.Error())
+		return
+	}
+
+	if strings.TrimSpace(h.cfg.EmailScriptPath) != "" {
+		user, err := h.store.CreateUserWithAccountNoSession(r.Context(), store.SignupParams{
+			Email:       req.Email,
+			Password:    req.Password,
+			AccountName: req.AccountName,
+		})
+		if err != nil {
+			switch {
+			case errors.Is(err, store.ErrConflict):
+				writeError(w, http.StatusConflict, "conflict", "A user with that email already exists.")
+			default:
+				writeError(w, http.StatusInternalServerError, "internal_error", "Failed to create user.")
+			}
+			return
+		}
+		if err := h.startEmailChallenge(r.Context(), user, "login"); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to start email challenge.")
+			return
+		}
+		writeJSON(w, http.StatusCreated, map[string]any{
+			"challenge": challengePayload("login", user.Email),
+		})
 		return
 	}
 
@@ -182,7 +221,6 @@ func (h authHandler) handleSignup(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-
 	writeJSON(w, http.StatusCreated, authResponse{
 		Token: token,
 		User: userResponse{
@@ -193,11 +231,6 @@ func (h authHandler) handleSignup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h authHandler) handleLogin(w http.ResponseWriter, r *http.Request) {
-	if strings.TrimSpace(h.cfg.EmailScriptPath) != "" {
-		writeError(w, http.StatusNotImplemented, "two_factor_required", "Email challenge flow is not implemented yet.")
-		return
-	}
-
 	var req loginRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "validation_error", err.Error())
@@ -215,6 +248,17 @@ func (h authHandler) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if strings.TrimSpace(h.cfg.EmailScriptPath) != "" {
+		if err := h.startEmailChallenge(r.Context(), user, "login"); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to start email challenge.")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"challenge": challengePayload("login", user.Email),
+		})
+		return
+	}
+
 	token, err := h.store.CreateSessionToken(r.Context(), user.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to create session.")
@@ -228,6 +272,84 @@ func (h authHandler) handleLogin(w http.ResponseWriter, r *http.Request) {
 			Email: user.Email,
 		},
 	})
+}
+
+func (h authHandler) handleChallengeVerify(w http.ResponseWriter, r *http.Request) {
+	var req challengeVerifyRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "validation_error", err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Purpose) == "" {
+		req.Purpose = "login"
+	}
+	user, err := h.store.VerifyAuthAttempt(r.Context(), req.Email, req.Purpose, req.Code)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrInvalidCredentials):
+			writeError(w, http.StatusUnauthorized, "invalid_credentials", "Invalid email or code.")
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to verify challenge.")
+		}
+		return
+	}
+	token, err := h.store.CreateSessionToken(r.Context(), user.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to create session.")
+		return
+	}
+	writeJSON(w, http.StatusOK, authResponse{
+		Token: token,
+		User: userResponse{
+			UUID:  user.UUID,
+			Email: user.Email,
+		},
+	})
+}
+
+func (h authHandler) handleForgot(w http.ResponseWriter, r *http.Request) {
+	if strings.TrimSpace(h.cfg.EmailScriptPath) == "" {
+		writeError(w, http.StatusNotImplemented, "reset_not_enabled", "Password reset is not enabled.")
+		return
+	}
+	var req forgotRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "validation_error", err.Error())
+		return
+	}
+	user, err := h.store.UserByEmail(r.Context(), req.Email)
+	if err == nil {
+		if challengeErr := h.startEmailChallenge(r.Context(), user, "reset"); challengeErr != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to start reset challenge.")
+			return
+		}
+	} else if !errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to start reset challenge.")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (h authHandler) handleReset(w http.ResponseWriter, r *http.Request) {
+	var req resetRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "validation_error", err.Error())
+		return
+	}
+	if strings.TrimSpace(req.NewPassword) == "" {
+		writeError(w, http.StatusBadRequest, "validation_error", "newPassword is required")
+		return
+	}
+	if err := h.store.ResetPasswordWithCode(r.Context(), req.Email, req.Code, req.NewPassword); err != nil {
+		switch {
+		case errors.Is(err, store.ErrInvalidCredentials), errors.Is(err, store.ErrNotFound):
+			writeError(w, http.StatusUnauthorized, "invalid_credentials", "Invalid email or code.")
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to reset password.")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (h authHandler) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -312,6 +434,101 @@ func (h authHandler) handleAccountCreate(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusCreated, map[string]any{"account": account})
 }
 
+func (h authHandler) handleAccountGet(w http.ResponseWriter, r *http.Request, scope store.AccountScope) {
+	members, err := h.store.AccountMembers(r.Context(), scope.AccountID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load account members.")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"account": map[string]any{
+			"uuid":    scope.AccountUUID,
+			"name":    scope.AccountName,
+			"role":    scope.Role,
+			"members": members,
+		},
+	})
+}
+
+func (h authHandler) handleAccountInvite(w http.ResponseWriter, r *http.Request, scope store.AccountScope) {
+	if scope.Role != "owner" && scope.Role != "admin" {
+		writeError(w, http.StatusForbidden, "forbidden", "Only admins and owners can invite users.")
+		return
+	}
+	var req inviteRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "validation_error", err.Error())
+		return
+	}
+	if strings.TrimSpace(req.Role) == "" {
+		req.Role = "user"
+	}
+	invite, err := h.store.CreateInvite(r.Context(), scope.AccountID, req.Email, req.Role)
+	if err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			writeError(w, http.StatusNotFound, "not_found", "User not found.")
+		case errors.Is(err, store.ErrConflict):
+			writeError(w, http.StatusConflict, "conflict", "User is already a member of this account.")
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to create invite.")
+		}
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"invite": invite})
+}
+
+func (h authHandler) handleAccountUserRevoke(w http.ResponseWriter, r *http.Request, scope store.AccountScope, userUUID string) {
+	user, err := h.currentUser(r)
+	if err != nil {
+		writeAuthError(w, err)
+		return
+	}
+	if err := h.store.RevokeAccountUser(r.Context(), scope.AccountID, user.ID, scope.Role, strings.TrimSpace(userUUID)); err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			writeError(w, http.StatusNotFound, "not_found", "User is not a member of this account.")
+		case errors.Is(err, store.ErrConflict):
+			writeError(w, http.StatusConflict, "conflict", "That membership cannot be revoked.")
+		case errors.Is(err, store.ErrAuthRequired):
+			writeError(w, http.StatusForbidden, "forbidden", "Only admins and owners can revoke users.")
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to revoke user.")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (h authHandler) handleAccountTransfer(w http.ResponseWriter, r *http.Request, scope store.AccountScope) {
+	user, err := h.currentUser(r)
+	if err != nil {
+		writeAuthError(w, err)
+		return
+	}
+	if scope.Role != "owner" {
+		writeError(w, http.StatusForbidden, "forbidden", "Only the owner can transfer ownership.")
+		return
+	}
+	var req transferRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "validation_error", err.Error())
+		return
+	}
+	if err := h.store.TransferAccountOwnership(r.Context(), scope.AccountID, user.ID, req.Email); err != nil {
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			writeError(w, http.StatusNotFound, "not_found", "Transfer target must already be a member.")
+		case errors.Is(err, store.ErrConflict):
+			writeError(w, http.StatusConflict, "conflict", "Ownership cannot be transferred to that user.")
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to transfer ownership.")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (h authHandler) handleAccountSubroutes(w http.ResponseWriter, r *http.Request) {
 	user, err := h.currentUser(r)
 	if err != nil {
@@ -336,12 +553,20 @@ func (h authHandler) handleAccountSubroutes(w http.ResponseWriter, r *http.Reque
 	}
 
 	switch {
+	case tail == "" && r.Method == http.MethodGet:
+		h.handleAccountGet(w, r, scope)
+	case tail == "/invites" && r.Method == http.MethodPost:
+		h.handleAccountInvite(w, r, scope)
 	case tail == "/templates" && r.Method == http.MethodGet:
 		h.handleTemplatesList(w, r, scope)
 	case tail == "/vms" && r.Method == http.MethodGet:
 		h.handleVMsList(w, r, scope)
 	case tail == "/vms" && r.Method == http.MethodPost:
 		h.handleVMCreate(w, r, scope)
+	case tail == "/transfer" && r.Method == http.MethodPost:
+		h.handleAccountTransfer(w, r, scope)
+	case strings.HasPrefix(tail, "/users/") && strings.HasSuffix(tail, "/revoke") && r.Method == http.MethodPost:
+		h.handleAccountUserRevoke(w, r, scope, strings.TrimSuffix(strings.TrimPrefix(tail, "/users/"), "/revoke"))
 	case strings.HasPrefix(tail, "/vms/"):
 		h.handleVMSubroutes(w, r, scope, strings.TrimPrefix(tail, "/vms/"))
 	case strings.HasPrefix(tail, "/resolve-vm/") && r.Method == http.MethodGet:
@@ -349,6 +574,53 @@ func (h authHandler) handleAccountSubroutes(w http.ResponseWriter, r *http.Reque
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "Route not found.")
 	}
+}
+
+func (h authHandler) handleInvitesList(w http.ResponseWriter, r *http.Request) {
+	user, err := h.currentUser(r)
+	if err != nil {
+		writeAuthError(w, err)
+		return
+	}
+	invites, err := h.store.InvitesForUser(r.Context(), user.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load invites.")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"invites": invites})
+}
+
+func (h authHandler) handleInviteSubroutes(w http.ResponseWriter, r *http.Request) {
+	user, err := h.currentUser(r)
+	if err != nil {
+		writeAuthError(w, err)
+		return
+	}
+	inviteUUID, action, ok := splitInvitePath(r.URL.Path)
+	if !ok {
+		writeError(w, http.StatusNotFound, "not_found", "Route not found.")
+		return
+	}
+	var respondErr error
+	switch {
+	case action == "/accept" && r.Method == http.MethodPost:
+		respondErr = h.store.AcceptInvite(r.Context(), user.ID, inviteUUID)
+	case action == "/refuse" && r.Method == http.MethodPost:
+		respondErr = h.store.RefuseInvite(r.Context(), user.ID, inviteUUID)
+	default:
+		writeError(w, http.StatusNotFound, "not_found", "Route not found.")
+		return
+	}
+	if respondErr != nil {
+		switch {
+		case errors.Is(respondErr, store.ErrNotFound):
+			writeError(w, http.StatusNotFound, "not_found", "Invite not found.")
+		default:
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to update invite.")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (h authHandler) handleTemplatesList(w http.ResponseWriter, r *http.Request, scope store.AccountScope) {
@@ -704,6 +976,19 @@ func splitVMSubroute(path string) (vmName string, tail string) {
 	return vmName, "/" + parts[1]
 }
 
+func splitInvitePath(path string) (inviteUUID string, tail string, ok bool) {
+	const prefix = "/v1/invites/"
+	if !strings.HasPrefix(path, prefix) {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(path, prefix)
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" {
+		return "", "", false
+	}
+	return parts[0], "/" + parts[1], true
+}
+
 func resolveSSHHost(baseURL string) string {
 	parsed, err := url.Parse(strings.TrimSpace(baseURL))
 	if err == nil && parsed.Host != "" {
@@ -712,6 +997,26 @@ func resolveSSHHost(baseURL string) string {
 		}
 	}
 	return "127.0.0.1"
+}
+
+func (h authHandler) startEmailChallenge(ctx context.Context, user store.User, purpose string) error {
+	code, err := h.store.CreateAuthAttempt(ctx, user.ID, purpose)
+	if err != nil {
+		return err
+	}
+	command := exec.Command(h.cfg.EmailScriptPath, "--email", user.Email, "--code", code, "--purpose", purpose)
+	if output, err := command.CombinedOutput(); err != nil {
+		return fmt.Errorf("run email script: %w: %s", err, string(output))
+	}
+	return nil
+}
+
+func challengePayload(purpose, email string) map[string]string {
+	return map[string]string{
+		"type":    "email_code",
+		"purpose": purpose,
+		"email":   email,
+	}
 }
 
 func newUUIDLike() string {
