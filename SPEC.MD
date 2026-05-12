@@ -1378,7 +1378,7 @@ Response:
     "webReady": false
   },
   "ssh": {
-    "host": "rqst.dev",
+    "host": "api.rqst.dev",
     "port": 2222,
     "defaultUsername": "root",
     "ready": true
