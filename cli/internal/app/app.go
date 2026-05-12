@@ -16,6 +16,7 @@ import (
 	"rqstdev/cli/internal/config"
 	"rqstdev/cli/internal/secret"
 	"rqstdev/cli/internal/session"
+	"rqstdev/cli/internal/tui"
 )
 
 func Run(args []string) error {
@@ -103,34 +104,74 @@ func handleAuthenticatedRoot(w io.Writer, cfg config.Config, sess session.State,
 	}
 	account, accountErr := resolveAccount(cfg, sess, api, "")
 	invites, inviteErr := api.ListInvites()
-	if _, err := fmt.Fprintf(w, "rqstdev CLI\n\nServer: %s\nUser: %s\nDefault account: %s\nSession account: %s\n", cfg.BaseURL, user.Email, printable(cfg.DefaultAccount), printable(sess.ActiveAccount)); err != nil {
-		return err
+	lines := []string{
+		"Server: " + cfg.BaseURL,
+		"User: " + user.Email,
+		"Default account: " + printable(cfg.DefaultAccount),
+		"Session account: " + printable(sess.ActiveAccount),
 	}
 	if accountErr == nil {
-		if _, err := fmt.Fprintf(w, "Current account: %s (%s)\n", account.Name, account.UUID); err != nil {
-			return err
-		}
+		lines = append(lines, "Current account: "+account.Name+" ("+account.UUID+")")
 	}
 	if inviteErr == nil {
-		if _, err := fmt.Fprintf(w, "Pending invites: %d\n", len(invites)); err != nil {
-			return err
-		}
+		lines = append(lines, fmt.Sprintf("Pending invites: %d", len(invites)))
 	}
 	if accountErr == nil {
 		vms, err := api.ListVMs(account.UUID)
 		if err == nil {
-			if _, err := fmt.Fprintf(w, "VMs in current account: %d\n", len(vms)); err != nil {
-				return err
-			}
+			lines = append(lines, fmt.Sprintf("VMs in current account: %d", len(vms)))
 			for _, vm := range vms {
-				if _, err := fmt.Fprintf(w, "  %s\t%s\tssh=%t\tweb=%t\n", vm.Name, vm.State, vm.SSHReady, vm.WebReady); err != nil {
-					return err
-				}
+				lines = append(lines, fmt.Sprintf("  %s\t%s\tssh=%t\tweb=%t", vm.Name, vm.State, vm.SSHReady, vm.WebReady))
 			}
 		}
 	}
-	_, err = fmt.Fprintln(w, "\nCommands:\n  signup\n  login\n  logout\n  account\n  invites\n  list\n  add\n  delete\n  poweron\n  poweroff\n  kill\n  ssh\n  port")
-	return err
+	if !tui.CanUse() {
+		if _, err := fmt.Fprintln(w, "rqstdev CLI\n"); err != nil {
+			return err
+		}
+		for _, line := range lines {
+			if _, err := fmt.Fprintln(w, line); err != nil {
+				return err
+			}
+		}
+		_, err = fmt.Fprintln(w, "\nCommands:\n  signup\n  login\n  logout\n  account\n  invites\n  list\n  add\n  delete\n  poweron\n  poweroff\n  kill\n  ssh\n  port")
+		return err
+	}
+	options := []tui.Option{
+		{Label: "List VMs", Description: "Show VMs in the current account"},
+		{Label: "Add VM", Description: "Create a new VM"},
+		{Label: "SSH to VM", Description: "Open an SSH session"},
+		{Label: "Manage Invites", Description: "Review pending invites"},
+		{Label: "Account List", Description: "Show account memberships"},
+		{Label: "Logout", Description: "Delete the stored token"},
+		{Label: "Help", Description: "Print command reference"},
+		{Label: "Quit", Description: "Exit without running a command"},
+	}
+	choice, err := tui.Select("rqstdev", lines, options, 0)
+	if err != nil {
+		if errors.Is(err, tui.ErrAborted) {
+			return nil
+		}
+		return err
+	}
+	switch options[choice].Label {
+	case "List VMs":
+		return handleList(w, cfg, sess, api, "")
+	case "Add VM":
+		return handleAdd(w, cfg, sess, api, "", nil)
+	case "SSH to VM":
+		return handleSSH(cfg, sess, api, "", nil)
+	case "Manage Invites":
+		return handleInvites(w, cfg, api, nil)
+	case "Account List":
+		return handleAccount(w, &cfg, &sess, api, nil, "")
+	case "Logout":
+		return handleLogout(w, cfg, api)
+	case "Help":
+		return printRootHelp(w, cfg, sess)
+	default:
+		return nil
+	}
 }
 
 func printRootHelp(w io.Writer, cfg config.Config, sess session.State) error {
@@ -145,32 +186,42 @@ func printRootHelp(w io.Writer, cfg config.Config, sess session.State) error {
 }
 
 func handleUnauthenticatedRoot(w io.Writer, cfg *config.Config) error {
-	reader := bufio.NewReader(os.Stdin)
-	choice, err := prompt(reader, "Not authenticated. Choose login or signup", "login")
-	if err != nil {
-		return err
+	choice := "login"
+	if tui.CanUse() {
+		index, err := tui.Select("rqstdev", []string{"No stored token found."}, []tui.Option{
+			{Label: "Login", Description: "Authenticate an existing user"},
+			{Label: "Signup", Description: "Create a user and initial account"},
+			{Label: "Quit", Description: "Exit without logging in"},
+		}, 0)
+		if err != nil {
+			if errors.Is(err, tui.ErrAborted) {
+				return nil
+			}
+			return err
+		}
+		choice = strings.ToLower([]string{"login", "signup", "quit"}[index])
+	} else {
+		reader := bufio.NewReader(os.Stdin)
+		value, err := prompt(reader, "Not authenticated. Choose login or signup", "login")
+		if err != nil {
+			return err
+		}
+		choice = strings.ToLower(strings.TrimSpace(value))
 	}
-	switch strings.ToLower(strings.TrimSpace(choice)) {
+	switch choice {
 	case "", "login":
 		return handleLogin(w, cfg)
 	case "signup":
 		return handleSignup(w, cfg)
+	case "quit":
+		return nil
 	default:
 		return fmt.Errorf("unknown choice %q", choice)
 	}
 }
 
 func handleSignup(w io.Writer, cfg *config.Config) error {
-	reader := bufio.NewReader(os.Stdin)
-	email, err := prompt(reader, "Email", cfg.LastEmail)
-	if err != nil {
-		return err
-	}
-	password, err := promptPassword("Password")
-	if err != nil {
-		return err
-	}
-	accountName, err := prompt(reader, "Initial account name", "My Account")
+	email, password, accountName, err := signupInputs(cfg.LastEmail)
 	if err != nil {
 		return err
 	}
@@ -183,12 +234,7 @@ func handleSignup(w io.Writer, cfg *config.Config) error {
 }
 
 func handleLogin(w io.Writer, cfg *config.Config) error {
-	reader := bufio.NewReader(os.Stdin)
-	email, err := prompt(reader, "Email", cfg.LastEmail)
-	if err != nil {
-		return err
-	}
-	password, err := promptPassword("Password")
+	email, password, err := loginInputs(cfg.LastEmail)
 	if err != nil {
 		return err
 	}
@@ -241,7 +287,19 @@ func handleAccount(w io.Writer, cfg *config.Config, sess *session.State, api *cl
 	switch args[0] {
 	case "create":
 		if len(args) < 2 {
-			return errors.New("account create requires a name")
+			if tui.CanUse() {
+				values, err := tui.Inputs("Create Account", nil, []tui.Field{{
+					Key:   "name",
+					Label: "Account name",
+					Value: "My Account",
+				}})
+				if err != nil {
+					return err
+				}
+				args = append(args, values["name"])
+			} else {
+				return errors.New("account create requires a name")
+			}
 		}
 		account, err := api.CreateAccount(strings.TrimSpace(strings.Join(args[1:], " ")))
 		if err != nil {
@@ -292,14 +350,19 @@ func handleAccount(w io.Writer, cfg *config.Config, sess *session.State, api *cl
 }
 
 func handleAccountAdd(w io.Writer, cfg *config.Config, api *client.Client, args []string) error {
-	if len(args) == 0 {
-		return errors.New("account add requires a visible remote account name or UUID")
-	}
 	accounts, err := api.ListAccounts()
 	if err != nil {
 		return handleClientError(cfg.BaseURL, err)
 	}
-	target, err := resolveRemoteAccount(accounts, args[0])
+	var target client.Account
+	if len(args) == 0 {
+		target, err = selectRemoteAccount(accounts)
+		if err != nil {
+			return err
+		}
+	} else {
+		target, err = resolveRemoteAccount(accounts, args[0])
+	}
 	if err != nil {
 		return err
 	}
@@ -322,6 +385,13 @@ func handleAccountAdd(w io.Writer, cfg *config.Config, api *client.Client, args 
 }
 
 func handleAccountRemove(w io.Writer, cfg *config.Config, sess *session.State, args []string) error {
+	if len(args) == 0 && tui.CanUse() {
+		ref, err := selectLocalAccount(*cfg)
+		if err != nil {
+			return err
+		}
+		args = append(args, ref.Alias)
+	}
 	if len(args) == 0 {
 		return errors.New("account remove requires an alias, account name, or account UUID")
 	}
@@ -346,6 +416,13 @@ func handleAccountRemove(w io.Writer, cfg *config.Config, sess *session.State, a
 }
 
 func handleAccountDefault(w io.Writer, cfg *config.Config, args []string) error {
+	if len(args) == 0 && tui.CanUse() {
+		ref, err := selectLocalAccount(*cfg)
+		if err != nil {
+			return err
+		}
+		args = append(args, ref.Alias)
+	}
 	if len(args) == 0 {
 		return errors.New("account default requires an alias, account name, or account UUID")
 	}
@@ -362,6 +439,13 @@ func handleAccountDefault(w io.Writer, cfg *config.Config, args []string) error 
 }
 
 func handleAccountUse(w io.Writer, cfg *config.Config, sess *session.State, args []string) error {
+	if len(args) == 0 && tui.CanUse() {
+		ref, err := selectLocalAccount(*cfg)
+		if err != nil {
+			return err
+		}
+		args = append(args, ref.Alias)
+	}
 	if len(args) == 0 {
 		return errors.New("account use requires an alias, account name, or account UUID")
 	}
@@ -386,16 +470,7 @@ func handleForgot(w io.Writer, cfg *config.Config, args []string) error {
 	if err := api.Forgot(email); err != nil {
 		return err
 	}
-	reader := bufio.NewReader(os.Stdin)
-	code, err := prompt(reader, "Email code", "")
-	if err != nil {
-		return err
-	}
-	newPassword, err := promptPassword("New password")
-	if err != nil {
-		return err
-	}
-	confirm, err := promptPassword("Confirm new password")
+	code, newPassword, confirm, err := forgotInputs(email)
 	if err != nil {
 		return err
 	}
@@ -468,16 +543,11 @@ func handleAccountTransfer(w io.Writer, cfg *config.Config, sess *session.State,
 	}
 	_, _ = fmt.Fprintf(w, "Transferred ownership of %s to %s\n", account.Name, args[0])
 
-	reader := bufio.NewReader(os.Stdin)
-	answer, err := prompt(reader, "Create a new owned account? (y/N)", "N")
+	createNew, name, err := transferFollowup()
 	if err != nil {
 		return err
 	}
-	if strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes") {
-		name, err := prompt(reader, "New account name", "My Account")
-		if err != nil {
-			return err
-		}
+	if createNew {
 		created, err := api.CreateAccount(name)
 		if err != nil {
 			return handleClientError(cfg.BaseURL, err)
@@ -500,6 +570,25 @@ func handleInvites(w io.Writer, cfg config.Config, api *client.Client, args []st
 		}
 		if len(invites) == 0 {
 			_, err := fmt.Fprintln(w, "No pending invites.")
+			return err
+		}
+		if tui.CanUse() {
+			invite, action, err := selectInviteAction(invites)
+			if err != nil {
+				return err
+			}
+			switch action {
+			case "accept":
+				err = api.AcceptInvite(invite.UUID)
+			case "refuse":
+				err = api.RefuseInvite(invite.UUID)
+			default:
+				return nil
+			}
+			if err != nil {
+				return handleClientError(cfg.BaseURL, err)
+			}
+			_, err = fmt.Fprintf(w, "Invite %s %sed\n", invite.UUID, action)
 			return err
 		}
 		for i, invite := range invites {
@@ -594,55 +683,42 @@ func handleAdd(w io.Writer, cfg config.Config, sess session.State, api *client.C
 	if len(templates) == 0 {
 		return errors.New("no templates are available")
 	}
-	reader := bufio.NewReader(os.Stdin)
 	vmName := strings.TrimSpace(firstArg(args))
-	if vmName == "" {
-		vmName, err = prompt(reader, "VM name", "")
-		if err != nil {
-			return err
-		}
-	}
 
 	templateArg := strings.TrimSpace(secondArg(args))
 	guestPortArg := ""
 	template := templates[0]
-	if len(templates) > 1 {
-		templateChoice := templateArg
-		if templateChoice == "" {
-			templateChoice, err = prompt(reader, "Template UUID or name", template.Name)
-			if err != nil {
-				return err
-			}
+	if vmName == "" || (len(templates) > 1 && templateArg == "") || guestPortArg == "" {
+		var selectedTemplate string
+		if len(templates) > 1 {
+			selectedTemplate = template.Name
 		}
-		template, err = resolveTemplate(templates, templateChoice)
+		if templateArg != "" {
+			selectedTemplate = templateArg
+		}
+		vmName, templateArg, guestPortArg, err = addInputs(vmName, selectedTemplate, guestPortArg, templates)
 		if err != nil {
 			return err
 		}
-		guestPortArg = strings.TrimSpace(thirdArg(args))
-	} else {
-		if templateArg != "" {
-			if _, convErr := strconv.Atoi(templateArg); convErr == nil {
-				guestPortArg = templateArg
-			} else {
-				template, err = resolveTemplate(templates, templateArg)
-				if err != nil {
-					return err
-				}
-				guestPortArg = strings.TrimSpace(thirdArg(args))
+	}
+	if len(templates) > 1 {
+		template, err = resolveTemplate(templates, templateArg)
+		if err != nil {
+			return err
+		}
+	} else if templateArg != "" {
+		if _, convErr := strconv.Atoi(templateArg); convErr == nil {
+			guestPortArg = templateArg
+		} else {
+			template, err = resolveTemplate(templates, templateArg)
+			if err != nil {
+				return err
 			}
 		}
 	}
 	guestPort := 80
 	if portValue := strings.TrimSpace(guestPortArg); portValue != "" {
 		if guestPort, err = strconv.Atoi(portValue); err != nil {
-			return errors.New("guest web port must be numeric")
-		}
-	} else {
-		portValue, err := prompt(reader, "Guest web port", "80")
-		if err != nil {
-			return err
-		}
-		if guestPort, err = strconv.Atoi(strings.TrimSpace(portValue)); err != nil {
 			return errors.New("guest web port must be numeric")
 		}
 	}
@@ -665,12 +741,7 @@ func handleDelete(w io.Writer, cfg config.Config, sess session.State, api *clien
 	}
 	force := hasFlag(remaining, "--force")
 	if !force {
-		reader := bufio.NewReader(os.Stdin)
-		confirmation, err := prompt(reader, "Type DELETE to confirm", "")
-		if err != nil {
-			return err
-		}
-		if confirmation != "DELETE" {
+		if err := deleteConfirmation(vmName); err != nil {
 			return errors.New("delete cancelled")
 		}
 	}
@@ -825,8 +896,7 @@ func handlePortList(w io.Writer, cfg config.Config, sess session.State, api *cli
 
 func finalizeAuthResult(w io.Writer, cfg *config.Config, api *client.Client, result client.AuthResult) error {
 	if result.Challenge != nil {
-		reader := bufio.NewReader(os.Stdin)
-		code, err := prompt(reader, "Email code", "")
+		code, err := challengeInput(result.Challenge.Email, result.Challenge.Purpose)
 		if err != nil {
 			return err
 		}
@@ -921,6 +991,9 @@ func resolveAccount(cfg config.Config, sess session.State, api *client.Client, h
 	if len(accounts) == 1 {
 		return accounts[0], nil
 	}
+	if tui.CanUse() {
+		return selectRemoteAccount(accounts)
+	}
 	return client.Account{}, errors.New("multiple accounts available; use --account or set account default/use")
 }
 
@@ -942,6 +1015,268 @@ func resolveMember(members []client.AccountMember, identifier string) (string, e
 		}
 	}
 	return "", fmt.Errorf("member %q not found", identifier)
+}
+
+func selectRemoteAccount(accounts []client.Account) (client.Account, error) {
+	if len(accounts) == 0 {
+		return client.Account{}, errors.New("no accounts available")
+	}
+	if !tui.CanUse() {
+		return client.Account{}, errors.New("multiple accounts available; use --account or set account default/use")
+	}
+	options := make([]tui.Option, 0, len(accounts))
+	for _, account := range accounts {
+		options = append(options, tui.Option{
+			Label:       account.Name,
+			Description: fmt.Sprintf("%s %s", account.Role, account.UUID),
+		})
+	}
+	index, err := tui.Select("Select an account", nil, options, 0)
+	if err != nil {
+		return client.Account{}, err
+	}
+	return accounts[index], nil
+}
+
+func selectLocalAccount(cfg config.Config) (config.AccountRef, error) {
+	accounts := cfg.SortedAccounts()
+	if len(accounts) == 0 {
+		return config.AccountRef{}, errors.New("no local accounts configured")
+	}
+	if !tui.CanUse() {
+		return config.AccountRef{}, errors.New("no account identifier provided")
+	}
+	options := make([]tui.Option, 0, len(accounts))
+	for _, account := range accounts {
+		options = append(options, tui.Option{
+			Label:       account.Alias,
+			Description: fmt.Sprintf("%s %s", account.Name, account.UUID),
+		})
+	}
+	index, err := tui.Select("Select a local account", nil, options, 0)
+	if err != nil {
+		return config.AccountRef{}, err
+	}
+	return accounts[index], nil
+}
+
+func loginInputs(lastEmail string) (string, string, error) {
+	if tui.CanUse() {
+		values, err := tui.Inputs("Login", nil, []tui.Field{
+			{Key: "email", Label: "Email", Value: lastEmail},
+			{Key: "password", Label: "Password", Secret: true},
+		})
+		if err != nil {
+			return "", "", err
+		}
+		return values["email"], values["password"], nil
+	}
+	reader := bufio.NewReader(os.Stdin)
+	email, err := prompt(reader, "Email", lastEmail)
+	if err != nil {
+		return "", "", err
+	}
+	password, err := promptPassword("Password")
+	if err != nil {
+		return "", "", err
+	}
+	return email, password, nil
+}
+
+func signupInputs(lastEmail string) (string, string, string, error) {
+	if tui.CanUse() {
+		values, err := tui.Inputs("Signup", nil, []tui.Field{
+			{Key: "email", Label: "Email", Value: lastEmail},
+			{Key: "password", Label: "Password", Secret: true},
+			{Key: "account", Label: "Initial account name", Value: "My Account"},
+		})
+		if err != nil {
+			return "", "", "", err
+		}
+		return values["email"], values["password"], values["account"], nil
+	}
+	reader := bufio.NewReader(os.Stdin)
+	email, err := prompt(reader, "Email", lastEmail)
+	if err != nil {
+		return "", "", "", err
+	}
+	password, err := promptPassword("Password")
+	if err != nil {
+		return "", "", "", err
+	}
+	accountName, err := prompt(reader, "Initial account name", "My Account")
+	if err != nil {
+		return "", "", "", err
+	}
+	return email, password, accountName, nil
+}
+
+func forgotInputs(email string) (string, string, string, error) {
+	if tui.CanUse() {
+		values, err := tui.Inputs("Reset Password", []string{"Reset for " + email}, []tui.Field{
+			{Key: "code", Label: "Email code"},
+			{Key: "password", Label: "New password", Secret: true},
+			{Key: "confirm", Label: "Confirm new password", Secret: true},
+		})
+		if err != nil {
+			return "", "", "", err
+		}
+		return values["code"], values["password"], values["confirm"], nil
+	}
+	reader := bufio.NewReader(os.Stdin)
+	code, err := prompt(reader, "Email code", "")
+	if err != nil {
+		return "", "", "", err
+	}
+	newPassword, err := promptPassword("New password")
+	if err != nil {
+		return "", "", "", err
+	}
+	confirm, err := promptPassword("Confirm new password")
+	if err != nil {
+		return "", "", "", err
+	}
+	return code, newPassword, confirm, nil
+}
+
+func transferFollowup() (bool, string, error) {
+	if tui.CanUse() {
+		choice, err := tui.Confirm("Transfer Complete", []string{"Create a new owned account now?"}, "Create account", "Skip")
+		if err != nil {
+			return false, "", err
+		}
+		if choice != "Create account" {
+			return false, "", nil
+		}
+		values, err := tui.Inputs("New Account", nil, []tui.Field{{Key: "name", Label: "New account name", Value: "My Account"}})
+		if err != nil {
+			return false, "", err
+		}
+		return true, values["name"], nil
+	}
+	reader := bufio.NewReader(os.Stdin)
+	answer, err := prompt(reader, "Create a new owned account? (y/N)", "N")
+	if err != nil {
+		return false, "", err
+	}
+	if strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes") {
+		name, err := prompt(reader, "New account name", "My Account")
+		if err != nil {
+			return false, "", err
+		}
+		return true, name, nil
+	}
+	return false, "", nil
+}
+
+func challengeInput(email, purpose string) (string, error) {
+	if tui.CanUse() {
+		values, err := tui.Inputs("Email Challenge", []string{purpose + " for " + email}, []tui.Field{{Key: "code", Label: "Email code"}})
+		if err != nil {
+			return "", err
+		}
+		return values["code"], nil
+	}
+	reader := bufio.NewReader(os.Stdin)
+	return prompt(reader, "Email code", "")
+}
+
+func addInputs(vmName, templateName, guestPort string, templates []client.Template) (string, string, string, error) {
+	if tui.CanUse() {
+		var templateValue string
+		if len(templates) == 1 {
+			templateValue = templates[0].Name
+		} else {
+			options := make([]tui.Option, 0, len(templates))
+			initial := 0
+			for i, template := range templates {
+				options = append(options, tui.Option{
+					Label:       template.Name,
+					Description: fmt.Sprintf("%s cpu=%d mem=%dMB", template.UUID, template.DefaultCPU, template.DefaultMemoryMB),
+				})
+				if template.Name == templateName || template.UUID == templateName {
+					initial = i
+				}
+			}
+			index, err := tui.Select("Choose a template", nil, options, initial)
+			if err != nil {
+				return "", "", "", err
+			}
+			templateValue = templates[index].Name
+		}
+		values, err := tui.Inputs("Create VM", nil, []tui.Field{
+			{Key: "name", Label: "VM name", Value: vmName},
+			{Key: "port", Label: "Guest web port", Value: defaultString(guestPort, "80")},
+		})
+		if err != nil {
+			return "", "", "", err
+		}
+		return values["name"], templateValue, values["port"], nil
+	}
+	reader := bufio.NewReader(os.Stdin)
+	if vmName == "" {
+		value, err := prompt(reader, "VM name", "")
+		if err != nil {
+			return "", "", "", err
+		}
+		vmName = value
+	}
+	if len(templates) > 1 && templateName == "" {
+		value, err := prompt(reader, "Template UUID or name", templates[0].Name)
+		if err != nil {
+			return "", "", "", err
+		}
+		templateName = value
+	}
+	if guestPort == "" {
+		value, err := prompt(reader, "Guest web port", "80")
+		if err != nil {
+			return "", "", "", err
+		}
+		guestPort = value
+	}
+	return vmName, templateName, guestPort, nil
+}
+
+func deleteConfirmation(vmName string) error {
+	if tui.CanUse() {
+		return tui.RequireText("Delete VM", []string{"Delete " + vmName, "Type DELETE to confirm."}, "Confirmation", "DELETE")
+	}
+	reader := bufio.NewReader(os.Stdin)
+	confirmation, err := prompt(reader, "Type DELETE to confirm", "")
+	if err != nil {
+		return err
+	}
+	if confirmation != "DELETE" {
+		return errors.New("delete cancelled")
+	}
+	return nil
+}
+
+func selectInviteAction(invites []client.Invite) (client.Invite, string, error) {
+	options := make([]tui.Option, 0, len(invites))
+	for _, invite := range invites {
+		options = append(options, tui.Option{
+			Label:       invite.AccountName,
+			Description: fmt.Sprintf("%s %s", invite.Role, invite.UUID),
+		})
+	}
+	index, err := tui.Select("Pending Invites", []string{"Choose an invite to act on."}, options, 0)
+	if err != nil {
+		return client.Invite{}, "", err
+	}
+	action, err := tui.Confirm("Invite Action", []string{"Invite for " + invites[index].AccountName}, "accept", "refuse", "cancel")
+	if err != nil {
+		return client.Invite{}, "", err
+	}
+	return invites[index], action, nil
+}
+
+func defaultString(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 func prompt(reader *bufio.Reader, label, defaultValue string) (string, error) {
@@ -1028,6 +1363,20 @@ func resolveVMArgument(api *client.Client, accountUUID string, args []string) (s
 }
 
 func selectVM(vms []client.VM) (string, error) {
+	if tui.CanUse() {
+		options := make([]tui.Option, 0, len(vms))
+		for _, vm := range vms {
+			options = append(options, tui.Option{
+				Label:       vm.Name,
+				Description: fmt.Sprintf("%s ssh=%t web=%t", vm.State, vm.SSHReady, vm.WebReady),
+			})
+		}
+		index, err := tui.Select("Select a VM", nil, options, 0)
+		if err != nil {
+			return "", err
+		}
+		return vms[index].Name, nil
+	}
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Fprintln(os.Stdout, "Select a VM:")
 	for i, vm := range vms {
