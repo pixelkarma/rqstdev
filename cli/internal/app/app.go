@@ -107,11 +107,11 @@ func handleAuthenticatedRoot(w io.Writer, cfg config.Config, sess session.State,
 	lines := []string{
 		"Server: " + cfg.BaseURL,
 		"User: " + user.Email,
-		"Default account: " + printable(cfg.DefaultAccount),
-		"Session account: " + printable(sess.ActiveAccount),
 	}
 	if accountErr == nil {
-		lines = append(lines, "Current account: "+account.Name+" ("+account.UUID+")")
+		lines = append(lines, "Current account: "+account.Name)
+	} else {
+		lines = append(lines, "Current account: <none>")
 	}
 	if inviteErr == nil {
 		lines = append(lines, fmt.Sprintf("Pending invites: %d", len(invites)))
@@ -177,10 +177,9 @@ func handleAuthenticatedRoot(w io.Writer, cfg config.Config, sess session.State,
 func printRootHelp(w io.Writer, cfg config.Config, sess session.State) error {
 	_, err := fmt.Fprintf(
 		w,
-		"rqstdev CLI\n\nServer: %s\nDefault account: %s\nSession account: %s\n\nCommands:\n  signup\n  login\n  logout\n  account\n  invites\n  list\n  add\n  delete\n  poweron\n  poweroff\n  kill\n  ssh\n  port\n",
+		"rqstdev CLI\n\nServer: %s\nCurrent account: %s\n\nCommands:\n  signup\n  login\n  logout\n  account\n  invites\n  list\n  add\n  delete\n  poweron\n  poweroff\n  kill\n  ssh\n  port\n",
 		cfg.BaseURL,
-		printable(cfg.DefaultAccount),
-		printable(sess.ActiveAccount),
+		currentAccountLabel(cfg, sess),
 	)
 	return err
 }
@@ -1418,4 +1417,20 @@ func printable(value string) string {
 		return "<none>"
 	}
 	return value
+}
+
+func currentAccountLabel(cfg config.Config, sess session.State) string {
+	if sess.ActiveAccount != "" {
+		if _, ref, ok := cfg.ResolveLocalAccount(sess.ActiveAccount); ok {
+			return ref.Name
+		}
+		return sess.ActiveAccount
+	}
+	if cfg.DefaultAccount != "" {
+		if _, ref, ok := cfg.ResolveLocalAccount(cfg.DefaultAccount); ok {
+			return ref.Name
+		}
+		return cfg.DefaultAccount
+	}
+	return "<none>"
 }
