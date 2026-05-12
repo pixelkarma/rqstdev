@@ -138,14 +138,14 @@ func handleAuthenticatedRoot(w io.Writer, cfg config.Config, sess session.State,
 		return err
 	}
 	options := []tui.Option{
-		{Label: "List VMs", Description: "Show VMs in the current account"},
-		{Label: "Add VM", Description: "Create a new VM"},
-		{Label: "SSH to VM", Description: "Open an SSH session"},
-		{Label: "Manage Invites", Description: "Review pending invites"},
-		{Label: "Account List", Description: "Show account memberships"},
-		{Label: "Logout", Description: "Delete the stored token"},
-		{Label: "Help", Description: "Print command reference"},
-		{Label: "Quit", Description: "Exit without running a command"},
+		{Label: "List VMs"},
+		{Label: "Add VM"},
+		{Label: "SSH to VM"},
+		{Label: "Manage Invites"},
+		{Label: "Account List"},
+		{Label: "Logout"},
+		{Label: "Help"},
+		{Label: "Quit"},
 	}
 	choice, err := tui.Select("rqstdev", lines, options, 0)
 	if err != nil {
@@ -189,9 +189,9 @@ func handleUnauthenticatedRoot(w io.Writer, cfg *config.Config) error {
 	choice := "login"
 	if tui.CanUse() {
 		index, err := tui.Select("rqstdev", []string{"No stored token found."}, []tui.Option{
-			{Label: "Login", Description: "Authenticate an existing user"},
-			{Label: "Signup", Description: "Create a user and initial account"},
-			{Label: "Quit", Description: "Exit without logging in"},
+			{Label: "Login"},
+			{Label: "Signup"},
+			{Label: "Quit"},
 		}, 0)
 		if err != nil {
 			if errors.Is(err, tui.ErrAborted) {
@@ -1026,10 +1026,7 @@ func selectRemoteAccount(accounts []client.Account) (client.Account, error) {
 	}
 	options := make([]tui.Option, 0, len(accounts))
 	for _, account := range accounts {
-		options = append(options, tui.Option{
-			Label:       account.Name,
-			Description: fmt.Sprintf("%s %s", account.Role, account.UUID),
-		})
+		options = append(options, tui.Option{Label: account.Name})
 	}
 	index, err := tui.Select("Select an account", nil, options, 0)
 	if err != nil {
@@ -1048,10 +1045,7 @@ func selectLocalAccount(cfg config.Config) (config.AccountRef, error) {
 	}
 	options := make([]tui.Option, 0, len(accounts))
 	for _, account := range accounts {
-		options = append(options, tui.Option{
-			Label:       account.Alias,
-			Description: fmt.Sprintf("%s %s", account.Name, account.UUID),
-		})
+		options = append(options, tui.Option{Label: account.Alias})
 	}
 	index, err := tui.Select("Select a local account", nil, options, 0)
 	if err != nil {
@@ -1190,10 +1184,7 @@ func addInputs(vmName, templateName, guestPort string, templates []client.Templa
 			options := make([]tui.Option, 0, len(templates))
 			initial := 0
 			for i, template := range templates {
-				options = append(options, tui.Option{
-					Label:       template.Name,
-					Description: fmt.Sprintf("%s cpu=%d mem=%dMB", template.UUID, template.DefaultCPU, template.DefaultMemoryMB),
-				})
+				options = append(options, tui.Option{Label: template.Name})
 				if template.Name == templateName || template.UUID == templateName {
 					initial = i
 				}
@@ -1256,10 +1247,7 @@ func deleteConfirmation(vmName string) error {
 func selectInviteAction(invites []client.Invite) (client.Invite, string, error) {
 	options := make([]tui.Option, 0, len(invites))
 	for _, invite := range invites {
-		options = append(options, tui.Option{
-			Label:       invite.AccountName,
-			Description: fmt.Sprintf("%s %s", invite.Role, invite.UUID),
-		})
+		options = append(options, tui.Option{Label: invite.AccountName})
 	}
 	index, err := tui.Select("Pending Invites", []string{"Choose an invite to act on."}, options, 0)
 	if err != nil {
@@ -1366,10 +1354,7 @@ func selectVM(vms []client.VM) (string, error) {
 	if tui.CanUse() {
 		options := make([]tui.Option, 0, len(vms))
 		for _, vm := range vms {
-			options = append(options, tui.Option{
-				Label:       vm.Name,
-				Description: fmt.Sprintf("%s ssh=%t web=%t", vm.State, vm.SSHReady, vm.WebReady),
-			})
+			options = append(options, tui.Option{Label: vm.Name})
 		}
 		index, err := tui.Select("Select a VM", nil, options, 0)
 		if err != nil {
