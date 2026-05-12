@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-const defaultBaseURL = "https://rqst.dev"
+const defaultBaseURL = "https://api.rqst.dev"
 
 type Config struct {
 	BaseURL string `json:"base_url"`

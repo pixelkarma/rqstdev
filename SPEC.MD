@@ -97,7 +97,7 @@ All VMs run on the same Linux machine as `./api`.
 ### DNS and ingress
 
 - wildcard DNS such as `*.rqst.dev` points to the single public host running `./api` and `nginx`
-- the API base URL defaults to `https://rqst.dev`
+- the API base URL defaults to `https://api.rqst.dev`
 - the CLI must allow a different explicit base URL, including `http://` or `https://`
 - public DNS is not managed by the product
 
@@ -449,7 +449,7 @@ If `<name>` is omitted where supported, the CLI may present an interactive selec
 
 ### API base URL
 
-- CLI default suggestion: `https://rqst.dev`
+- CLI default suggestion: `https://api.rqst.dev`
 - CLI must support operator-specified alternative URLs
 - the URL must be explicit, including `http://` or `https://`
 
