@@ -51,7 +51,8 @@ func run(w io.Writer, args []string) error {
 		if token == "" {
 			return handleUnauthenticatedRoot(w, &cfg)
 		}
-		return printRootHelp(w, cfg, sess)
+		api := client.New(cfg.BaseURL, token)
+		return handleAuthenticatedRoot(w, cfg, sess, api)
 	}
 	api := client.New(cfg.BaseURL, token)
 
@@ -87,6 +88,49 @@ func run(w io.Writer, args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q", rest[0])
 	}
+}
+
+func handleAuthenticatedRoot(w io.Writer, cfg config.Config, sess session.State, api *client.Client) error {
+	user, accounts, err := api.Me()
+	if err != nil {
+		return handleClientError(cfg.BaseURL, err)
+	}
+	if err := syncAccounts(&cfg, accounts); err != nil {
+		return err
+	}
+	if err := config.Save(cfg); err != nil {
+		return err
+	}
+	account, accountErr := resolveAccount(cfg, sess, api, "")
+	invites, inviteErr := api.ListInvites()
+	if _, err := fmt.Fprintf(w, "rqstdev CLI\n\nServer: %s\nUser: %s\nDefault account: %s\nSession account: %s\n", cfg.BaseURL, user.Email, printable(cfg.DefaultAccount), printable(sess.ActiveAccount)); err != nil {
+		return err
+	}
+	if accountErr == nil {
+		if _, err := fmt.Fprintf(w, "Current account: %s (%s)\n", account.Name, account.UUID); err != nil {
+			return err
+		}
+	}
+	if inviteErr == nil {
+		if _, err := fmt.Fprintf(w, "Pending invites: %d\n", len(invites)); err != nil {
+			return err
+		}
+	}
+	if accountErr == nil {
+		vms, err := api.ListVMs(account.UUID)
+		if err == nil {
+			if _, err := fmt.Fprintf(w, "VMs in current account: %d\n", len(vms)); err != nil {
+				return err
+			}
+			for _, vm := range vms {
+				if _, err := fmt.Fprintf(w, "  %s\t%s\tssh=%t\tweb=%t\n", vm.Name, vm.State, vm.SSHReady, vm.WebReady); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	_, err = fmt.Fprintln(w, "\nCommands:\n  signup\n  login\n  logout\n  account\n  invites\n  list\n  add\n  delete\n  poweron\n  poweroff\n  kill\n  ssh\n  port")
+	return err
 }
 
 func printRootHelp(w io.Writer, cfg config.Config, sess session.State) error {
@@ -458,12 +502,40 @@ func handleInvites(w io.Writer, cfg config.Config, api *client.Client, args []st
 			_, err := fmt.Fprintln(w, "No pending invites.")
 			return err
 		}
-		for _, invite := range invites {
-			if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", invite.UUID, invite.AccountName, invite.Role, invite.CreatedAt); err != nil {
+		for i, invite := range invites {
+			if _, err := fmt.Fprintf(w, "%d.\t%s\t%s\t%s\t%s\n", i+1, invite.UUID, invite.AccountName, invite.Role, invite.CreatedAt); err != nil {
 				return err
 			}
 		}
-		return nil
+		reader := bufio.NewReader(os.Stdin)
+		selection, err := prompt(reader, "Invite number to accept/refuse (blank to exit)", "")
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(selection) == "" {
+			return nil
+		}
+		index, err := strconv.Atoi(strings.TrimSpace(selection))
+		if err != nil || index < 1 || index > len(invites) {
+			return errors.New("invalid invite selection")
+		}
+		action, err := prompt(reader, "Action accept/refuse", "accept")
+		if err != nil {
+			return err
+		}
+		switch strings.ToLower(strings.TrimSpace(action)) {
+		case "accept":
+			err = api.AcceptInvite(invites[index-1].UUID)
+		case "refuse":
+			err = api.RefuseInvite(invites[index-1].UUID)
+		default:
+			return fmt.Errorf("unknown invite action %q", action)
+		}
+		if err != nil {
+			return handleClientError(cfg.BaseURL, err)
+		}
+		_, err = fmt.Fprintf(w, "Invite %s %sed\n", invites[index-1].UUID, strings.ToLower(strings.TrimSpace(action)))
+		return err
 	}
 	if len(args) < 2 {
 		return errors.New("invites accept|refuse requires an invite UUID")
@@ -583,11 +655,15 @@ func handleAdd(w io.Writer, cfg config.Config, sess session.State, api *client.C
 }
 
 func handleDelete(w io.Writer, cfg config.Config, sess session.State, api *client.Client, accountHint string, args []string) error {
-	if len(args) == 0 {
-		return errors.New("delete requires a VM name")
+	account, err := resolveAccount(cfg, sess, api, accountHint)
+	if err != nil {
+		return err
 	}
-	vmName := strings.TrimSpace(args[0])
-	force := hasFlag(args[1:], "--force")
+	vmName, remaining, err := resolveVMArgument(api, account.UUID, args)
+	if err != nil {
+		return err
+	}
+	force := hasFlag(remaining, "--force")
 	if !force {
 		reader := bufio.NewReader(os.Stdin)
 		confirmation, err := prompt(reader, "Type DELETE to confirm", "")
@@ -598,10 +674,6 @@ func handleDelete(w io.Writer, cfg config.Config, sess session.State, api *clien
 			return errors.New("delete cancelled")
 		}
 	}
-	account, err := resolveAccount(cfg, sess, api, accountHint)
-	if err != nil {
-		return err
-	}
 	if err := api.DeleteVM(account.UUID, vmName); err != nil {
 		return handleClientError(cfg.BaseURL, err)
 	}
@@ -610,14 +682,14 @@ func handleDelete(w io.Writer, cfg config.Config, sess session.State, api *clien
 }
 
 func handlePowerAction(w io.Writer, cfg config.Config, sess session.State, api *client.Client, accountHint string, args []string, action string) error {
-	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
-		return fmt.Errorf("%s requires a VM name", action)
-	}
 	account, err := resolveAccount(cfg, sess, api, accountHint)
 	if err != nil {
 		return err
 	}
-	vmName := strings.TrimSpace(args[0])
+	vmName, _, err := resolveVMArgument(api, account.UUID, args)
+	if err != nil {
+		return fmt.Errorf("%s: %w", action, err)
+	}
 
 	var vm client.VM
 	switch action {
@@ -638,16 +710,20 @@ func handlePowerAction(w io.Writer, cfg config.Config, sess session.State, api *
 }
 
 func handleSSH(cfg config.Config, sess session.State, api *client.Client, accountHint string, args []string) error {
-	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
-		return errors.New("ssh requires a VM name")
-	}
 	account, err := resolveAccount(cfg, sess, api, accountHint)
 	if err != nil {
 		return err
 	}
-	username, vmName := parseSSHVMTarget(args[0])
+	target := ""
+	if len(args) > 0 {
+		target = args[0]
+	}
+	username, vmName := parseSSHVMTarget(target)
 	if vmName == "" {
-		return errors.New("ssh requires a VM name")
+		vmName, _, err = resolveVMArgument(api, account.UUID, nil)
+		if err != nil {
+			return err
+		}
 	}
 	resolution, err := api.ResolveVM(account.UUID, vmName)
 	if err != nil {
@@ -676,18 +752,22 @@ func handlePort(w io.Writer, cfg config.Config, sess session.State, api *client.
 }
 
 func handlePortAdd(w io.Writer, cfg config.Config, sess session.State, api *client.Client, accountHint string, args []string) error {
-	if len(args) < 2 {
-		return errors.New("port add requires a VM name and public:guest mapping")
-	}
 	account, err := resolveAccount(cfg, sess, api, accountHint)
 	if err != nil {
 		return err
 	}
-	publicPort, guestPort, err := parsePortMapping(args[1])
+	vmName, remaining, err := resolveVMArgument(api, account.UUID, args)
 	if err != nil {
 		return err
 	}
-	port, err := api.AddPublishedPort(account.UUID, args[0], publicPort, guestPort)
+	if len(remaining) == 0 {
+		return errors.New("port add requires a public:guest mapping")
+	}
+	publicPort, guestPort, err := parsePortMapping(remaining[0])
+	if err != nil {
+		return err
+	}
+	port, err := api.AddPublishedPort(account.UUID, vmName, publicPort, guestPort)
 	if err != nil {
 		return handleClientError(cfg.BaseURL, err)
 	}
@@ -696,38 +776,43 @@ func handlePortAdd(w io.Writer, cfg config.Config, sess session.State, api *clie
 }
 
 func handlePortRemove(w io.Writer, cfg config.Config, sess session.State, api *client.Client, accountHint string, args []string) error {
-	if len(args) < 2 {
-		return errors.New("port remove requires a VM name and public port")
-	}
 	account, err := resolveAccount(cfg, sess, api, accountHint)
 	if err != nil {
 		return err
 	}
-	publicPort, err := strconv.Atoi(strings.TrimSpace(args[1]))
+	vmName, remaining, err := resolveVMArgument(api, account.UUID, args)
+	if err != nil {
+		return err
+	}
+	if len(remaining) == 0 {
+		return errors.New("port remove requires a public port")
+	}
+	publicPort, err := strconv.Atoi(strings.TrimSpace(remaining[0]))
 	if err != nil {
 		return errors.New("public port must be numeric")
 	}
-	if err := api.RemovePublishedPort(account.UUID, args[0], publicPort); err != nil {
+	if err := api.RemovePublishedPort(account.UUID, vmName, publicPort); err != nil {
 		return handleClientError(cfg.BaseURL, err)
 	}
-	_, err = fmt.Fprintf(w, "Removed published port %d from %s\n", publicPort, args[0])
+	_, err = fmt.Fprintf(w, "Removed published port %d from %s\n", publicPort, vmName)
 	return err
 }
 
 func handlePortList(w io.Writer, cfg config.Config, sess session.State, api *client.Client, accountHint string, args []string) error {
-	if len(args) == 0 {
-		return errors.New("port list requires a VM name")
-	}
 	account, err := resolveAccount(cfg, sess, api, accountHint)
 	if err != nil {
 		return err
 	}
-	ports, err := api.ListPublishedPorts(account.UUID, args[0])
+	vmName, _, err := resolveVMArgument(api, account.UUID, args)
+	if err != nil {
+		return err
+	}
+	ports, err := api.ListPublishedPorts(account.UUID, vmName)
 	if err != nil {
 		return handleClientError(cfg.BaseURL, err)
 	}
 	if len(ports) == 0 {
-		_, err := fmt.Fprintf(w, "No published ports for %s\n", args[0])
+		_, err := fmt.Fprintf(w, "No published ports for %s\n", vmName)
 		return err
 	}
 	for _, port := range ports {
@@ -922,6 +1007,41 @@ func resolveTemplate(templates []client.Template, identifier string) (client.Tem
 		}
 	}
 	return client.Template{}, fmt.Errorf("template %q not found", identifier)
+}
+
+func resolveVMArgument(api *client.Client, accountUUID string, args []string) (string, []string, error) {
+	if len(args) > 0 && strings.TrimSpace(args[0]) != "" {
+		return strings.TrimSpace(args[0]), args[1:], nil
+	}
+	vms, err := api.ListVMs(accountUUID)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(vms) == 0 {
+		return "", nil, errors.New("no VMs are available")
+	}
+	selected, err := selectVM(vms)
+	if err != nil {
+		return "", nil, err
+	}
+	return selected, args, nil
+}
+
+func selectVM(vms []client.VM) (string, error) {
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Fprintln(os.Stdout, "Select a VM:")
+	for i, vm := range vms {
+		fmt.Fprintf(os.Stdout, "  %d. %s\t%s\tssh=%t\tweb=%t\n", i+1, vm.Name, vm.State, vm.SSHReady, vm.WebReady)
+	}
+	selection, err := prompt(reader, "VM number", "")
+	if err != nil {
+		return "", err
+	}
+	index, err := strconv.Atoi(strings.TrimSpace(selection))
+	if err != nil || index < 1 || index > len(vms) {
+		return "", errors.New("invalid VM selection")
+	}
+	return vms[index-1].Name, nil
 }
 
 func firstArg(values []string) string {
