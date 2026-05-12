@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -55,6 +56,16 @@ type createVMRequest struct {
 	Name         string `json:"name"`
 	TemplateUUID string `json:"templateUUID"`
 	GuestWebPort int    `json:"guestWebPort"`
+}
+
+type sshResolveResponse struct {
+	VM  store.VM `json:"vm"`
+	SSH struct {
+		Host            string `json:"host"`
+		Port            int    `json:"port"`
+		DefaultUsername string `json:"defaultUsername"`
+		Ready           bool   `json:"ready"`
+	} `json:"ssh"`
 }
 
 type authResponse struct {
@@ -331,6 +342,10 @@ func (h authHandler) handleAccountSubroutes(w http.ResponseWriter, r *http.Reque
 		h.handleVMsList(w, r, scope)
 	case tail == "/vms" && r.Method == http.MethodPost:
 		h.handleVMCreate(w, r, scope)
+	case strings.HasPrefix(tail, "/vms/"):
+		h.handleVMSubroutes(w, r, scope, strings.TrimPrefix(tail, "/vms/"))
+	case strings.HasPrefix(tail, "/resolve-vm/") && r.Method == http.MethodGet:
+		h.handleVMResolve(w, r, scope, strings.TrimPrefix(tail, "/resolve-vm/"))
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "Route not found.")
 	}
@@ -350,6 +365,9 @@ func (h authHandler) handleVMsList(w http.ResponseWriter, r *http.Request, scope
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load VMs.")
 		return
+	}
+	for index := range vms {
+		h.refreshVMObservation(&vms[index])
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"vms": vms})
 }
@@ -431,12 +449,206 @@ func (h authHandler) handleVMCreate(w http.ResponseWriter, r *http.Request, scop
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to reload nginx.")
 		return
 	}
-	if err := h.store.UpdateVMState(r.Context(), vm.ID, "running", ""); err != nil {
+	go h.monitorVMReadiness(vm)
+	writeJSON(w, http.StatusCreated, map[string]any{"vm": vm})
+}
+
+func (h authHandler) handleVMSubroutes(w http.ResponseWriter, r *http.Request, scope store.AccountScope, tail string) {
+	vmName, action := splitVMSubroute(tail)
+	if vmName == "" {
+		writeError(w, http.StatusNotFound, "not_found", "Route not found.")
+		return
+	}
+
+	switch {
+	case action == "" && r.Method == http.MethodGet:
+		h.handleVMGet(w, r, scope, vmName)
+	case action == "/poweroff" && r.Method == http.MethodPost:
+		h.handleVMPoweroff(w, r, scope, vmName)
+	case action == "/kill" && r.Method == http.MethodPost:
+		h.handleVMKill(w, r, scope, vmName)
+	case action == "/poweron" && r.Method == http.MethodPost:
+		h.handleVMPoweron(w, r, scope, vmName)
+	default:
+		writeError(w, http.StatusNotFound, "not_found", "Route not found.")
+	}
+}
+
+func (h authHandler) handleVMGet(w http.ResponseWriter, r *http.Request, scope store.AccountScope, vmName string) {
+	vm, err := h.store.VMForAccountByName(r.Context(), scope.AccountID, scope.AccountUUID, vmName)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "VM not found.")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load VM.")
+		return
+	}
+	h.refreshVMObservation(&vm)
+	writeJSON(w, http.StatusOK, map[string]any{"vm": vm})
+}
+
+func (h authHandler) handleVMResolve(w http.ResponseWriter, r *http.Request, scope store.AccountScope, vmName string) {
+	vm, err := h.store.VMForAccountByName(r.Context(), scope.AccountID, scope.AccountUUID, vmName)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "VM not found.")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load VM.")
+		return
+	}
+	h.refreshVMObservation(&vm)
+
+	host := resolveSSHHost(h.cfg.BaseURL)
+	var resp sshResolveResponse
+	resp.VM = vm
+	resp.SSH.Host = host
+	resp.SSH.Port = vm.HostSSHPort
+	resp.SSH.DefaultUsername = h.cfg.DefaultSSHUser
+	resp.SSH.Ready = vm.SSHReady
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h authHandler) handleVMPoweroff(w http.ResponseWriter, r *http.Request, scope store.AccountScope, vmName string) {
+	vm, ok := h.loadVMForAction(w, r, scope, vmName)
+	if !ok {
+		return
+	}
+	if err := h.vmrt.PoweroffVM(vm); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to power off VM.")
+		return
+	}
+	if h.vmrt.WaitForSSHClosed(vm.HostSSHPort, 30*time.Second) {
+		if err := h.store.UpdateVMState(r.Context(), vm.ID, "stopped", ""); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to update VM state.")
+			return
+		}
+		if err := h.store.UpdateVMReadiness(r.Context(), vm.ID, false, false); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to update VM readiness.")
+			return
+		}
+		vm.State = "stopped"
+		vm.SSHReady = false
+		vm.WebReady = false
+		writeJSON(w, http.StatusOK, map[string]any{"vm": vm})
+		return
+	}
+	h.refreshVMObservation(&vm)
+	writeJSON(w, http.StatusOK, map[string]any{"vm": vm})
+}
+
+func (h authHandler) handleVMKill(w http.ResponseWriter, r *http.Request, scope store.AccountScope, vmName string) {
+	vm, ok := h.loadVMForAction(w, r, scope, vmName)
+	if !ok {
+		return
+	}
+	if err := h.vmrt.KillVM(vm); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to kill VM.")
+		return
+	}
+	if !h.vmrt.WaitForSSHClosed(vm.HostSSHPort, 10*time.Second) {
+		writeError(w, http.StatusInternalServerError, "internal_error", "VM did not stop after kill.")
+		return
+	}
+	if err := h.store.UpdateVMState(r.Context(), vm.ID, "stopped", ""); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to update VM state.")
 		return
 	}
-	vm.State = "running"
-	writeJSON(w, http.StatusCreated, map[string]any{"vm": vm})
+	if err := h.store.UpdateVMReadiness(r.Context(), vm.ID, false, false); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to update VM readiness.")
+		return
+	}
+	vm.State = "stopped"
+	vm.SSHReady = false
+	vm.WebReady = false
+	writeJSON(w, http.StatusOK, map[string]any{"vm": vm})
+}
+
+func (h authHandler) handleVMPoweron(w http.ResponseWriter, r *http.Request, scope store.AccountScope, vmName string) {
+	vm, ok := h.loadVMForAction(w, r, scope, vmName)
+	if !ok {
+		return
+	}
+	if err := h.vmrt.StartExistingVM(vm); err != nil {
+		_ = h.store.UpdateVMState(r.Context(), vm.ID, "error", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to start VM.")
+		return
+	}
+	if err := h.store.UpdateVMState(r.Context(), vm.ID, "creating", ""); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to update VM state.")
+		return
+	}
+	if err := h.store.UpdateVMReadiness(r.Context(), vm.ID, false, false); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to update VM readiness.")
+		return
+	}
+	vm.State = "creating"
+	vm.SSHReady = false
+	vm.WebReady = false
+	go h.monitorVMReadiness(vm)
+	writeJSON(w, http.StatusOK, map[string]any{"vm": vm})
+}
+
+func (h authHandler) loadVMForAction(w http.ResponseWriter, r *http.Request, scope store.AccountScope, vmName string) (store.VM, bool) {
+	if scope.Role != "owner" && scope.Role != "admin" && scope.Role != "user" {
+		writeError(w, http.StatusForbidden, "forbidden", "Account access denied.")
+		return store.VM{}, false
+	}
+	vm, err := h.store.VMForAccountByName(r.Context(), scope.AccountID, scope.AccountUUID, vmName)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "VM not found.")
+		} else {
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load VM.")
+		}
+		return store.VM{}, false
+	}
+	return vm, true
+}
+
+func (h authHandler) monitorVMReadiness(vm store.VM) {
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			_ = h.store.UpdateVMState(context.Background(), vm.ID, "error", "timed out waiting for SSH readiness")
+			_ = h.store.UpdateVMReadiness(context.Background(), vm.ID, false, false)
+			return
+		case <-ticker.C:
+			if !h.vmrt.WaitForSSHReady(vm.HostSSHPort, 4*time.Second) {
+				continue
+			}
+			webReady := h.vmrt.ProbeWebReady(vm.HostWebPort, 6*time.Second)
+			_ = h.store.UpdateVMReadiness(context.Background(), vm.ID, true, webReady)
+			_ = h.store.UpdateVMState(context.Background(), vm.ID, "running", "")
+			return
+		}
+	}
+}
+
+func (h authHandler) refreshVMObservation(vm *store.VM) {
+	if vm == nil {
+		return
+	}
+	if vm.State != "creating" && (vm.State != "running" || vm.SSHReady) {
+		return
+	}
+	sshReady := h.vmrt.WaitForSSHReady(vm.HostSSHPort, 200*time.Millisecond)
+	if !sshReady {
+		return
+	}
+	if vm.State != "running" || !vm.SSHReady {
+		_ = h.store.UpdateVMReadiness(context.Background(), vm.ID, true, vm.WebReady)
+		_ = h.store.UpdateVMState(context.Background(), vm.ID, "running", "")
+		vm.State = "running"
+		vm.SSHReady = true
+	}
 }
 
 func (h authHandler) currentUser(r *http.Request) (store.User, error) {
@@ -478,6 +690,28 @@ func splitAccountPath(path string) (accountUUID string, tail string, ok bool) {
 		return accountUUID, "", true
 	}
 	return accountUUID, "/" + parts[1], true
+}
+
+func splitVMSubroute(path string) (vmName string, tail string) {
+	parts := strings.SplitN(strings.Trim(path, "/"), "/", 2)
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		return "", ""
+	}
+	vmName = parts[0]
+	if len(parts) == 1 {
+		return vmName, ""
+	}
+	return vmName, "/" + parts[1]
+}
+
+func resolveSSHHost(baseURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err == nil && parsed.Host != "" {
+		if host := parsed.Hostname(); host != "" {
+			return host
+		}
+	}
+	return "127.0.0.1"
 }
 
 func newUUIDLike() string {

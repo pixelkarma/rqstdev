@@ -341,6 +341,8 @@ Note:
 - no SSH key injection is required in v1
 - templates are assumed to already contain a bootable OS image
 - templates may include a default root user with password authentication
+- templates are not required to include a running web service
+- a cloned VM may be SSH-ready before it is web-ready
 
 ### VM templates
 
@@ -380,6 +382,13 @@ Supported states:
 - `deleting`
 - `error`
 
+Readiness expectations:
+
+- `creating` means the VM record exists and QEMU start has been attempted, but guest SSH is not yet confirmed
+- `running` means the guest SSH port is reachable through the host forwarding path
+- web readiness is tracked separately from the main VM state
+- a VM may be `running` while `webReady = false`
+
 ### Power behavior
 
 Supported actions:
@@ -391,6 +400,7 @@ Supported actions:
 Power-off behavior:
 
 - normal `poweroff` is graceful
+- a VM should only be marked `stopped` after the forwarded SSH path is no longer reachable
 - `kill` is immediate
 
 ### Deletion
@@ -700,6 +710,8 @@ Columns:
 - `account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT`
 - `template_id INTEGER NOT NULL REFERENCES vm_templates(id) ON DELETE RESTRICT`
 - `state TEXT NOT NULL`
+- `ssh_ready INTEGER NOT NULL DEFAULT 0`
+- `web_ready INTEGER NOT NULL DEFAULT 0`
 - `guest_ip_address TEXT`
 - `guest_web_port INTEGER NOT NULL DEFAULT 80`
 - `cpu_count INTEGER NOT NULL`
@@ -716,6 +728,7 @@ Columns:
 Rules:
 
 - `state` must be one of `creating`, `running`, `stopped`, `deleting`, `error`
+- `ssh_ready` and `web_ready` are boolean flags stored as `0/1`
 - `name` is globally unique and URL-safe
 
 Suggested indexes:
@@ -1229,7 +1242,10 @@ Behavior:
 - clone disk image
 - start QEMU
 - configure/reload web proxy
-- update VM to `running` or `error`
+- keep the VM in `creating` until guest SSH readiness is confirmed
+- update VM to `running` only after guest SSH becomes reachable
+- track guest web readiness separately from the main state
+- update VM to `error` if boot never reaches SSH readiness
 
 #### `GET /v1/accounts/{accountUUID}/vms/{vmName}`
 
@@ -1357,19 +1373,22 @@ Response:
 {
   "vm": {
     "name": "my-vm",
-    "state": "running"
+    "state": "running",
+    "sshReady": true,
+    "webReady": false
   },
   "ssh": {
     "host": "rqst.dev",
     "port": 2222,
-    "defaultUsername": "root"
+    "defaultUsername": "root",
+    "ready": true
   }
 }
 ```
 
 Note:
 
-- the exact SSH transport details may change with the final host networking implementation
+- the API host and resolved SSH port are the source of truth for CLI SSH connections
 - this endpoint exists so the CLI does not need to hardcode host-side SSH routing assumptions
 ## 14. Host Integration
 
@@ -1409,6 +1428,7 @@ The QEMU invocation should support at least:
 - configured memory
 - configured CPU count
 - QCOW2 disk attachment
+- user-mode networking with explicit host port forwards
 - QMP Unix socket creation
 - headless operation
 
@@ -1416,8 +1436,12 @@ Expected command features include:
 
 - `-m`
 - `-smp`
-- `-drive file=...,format=qcow2,if=virtio`
+- `-drive file=...,format=qcow2`
+- `-nic user,hostfwd=...`
+- `-boot d`
 - `-qmp unix:...,server,nowait`
+- `-monitor none`
+- `-serial file:...`
 - `-display none`
 
 Daemonized launch is acceptable in v1 if process tracking remains reliable.
@@ -1459,7 +1483,9 @@ The API is responsible for:
 
 The API is responsible for the host-side changes needed for:
 
-- guest private networking
+- QEMU user-mode guest networking
+- host-visible port forwarding for VM SSH access used by `rqstdev ssh`
+- localhost-only port forwarding for guest web targets behind `nginx`
 - published TCP port forwarding
 - cleanup on VM deletion or port removal
 

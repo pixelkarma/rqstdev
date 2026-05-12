@@ -43,19 +43,19 @@ func run(w io.Writer, args []string) error {
 	case "invites":
 		return handleInvites(w, *account)
 	case "list":
-		return printPlaceholder(w, "vm list", *account)
+		return handleList(w, api, *account)
 	case "add":
 		return printPlaceholder(w, "vm add", *account)
 	case "delete":
 		return printPlaceholder(w, "vm delete", *account)
 	case "poweron":
-		return printPlaceholder(w, "vm poweron", *account)
+		return handlePowerAction(w, api, *account, rest[1:], "poweron")
 	case "poweroff":
-		return printPlaceholder(w, "vm poweroff", *account)
+		return handlePowerAction(w, api, *account, rest[1:], "poweroff")
 	case "kill":
-		return printPlaceholder(w, "vm kill", *account)
+		return handlePowerAction(w, api, *account, rest[1:], "kill")
 	case "ssh":
-		return printPlaceholder(w, "vm ssh", *account)
+		return handleSSH(api, *account, rest[1:])
 	case "port":
 		return handlePort(w, rest[1:], *account)
 	case "help":
@@ -126,6 +126,82 @@ func handleInvites(w io.Writer, account string) error {
 	return printPlaceholder(w, "invites", account)
 }
 
+func handleList(w io.Writer, api *client.Client, accountHint string) error {
+	account, err := resolveAccount(api, accountHint)
+	if err != nil {
+		return err
+	}
+	vms, err := api.ListVMs(account.UUID)
+	if err != nil {
+		return err
+	}
+	if len(vms) == 0 {
+		_, err := fmt.Fprintf(w, "No VMs in account %q.\n", account.Name)
+		return err
+	}
+	for _, vm := range vms {
+		if _, err := fmt.Fprintf(w, "%s\t%s\tssh=%t\tweb=%t\tssh-port=%d\tweb-port=%d\n", vm.Name, vm.State, vm.SSHReady, vm.WebReady, vm.HostSSHPort, vm.HostWebPort); err != nil {
+			return err
+		}
+		if vm.LastError != "" {
+			if _, err := fmt.Fprintf(w, "  error: %s\n", vm.LastError); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func handlePowerAction(w io.Writer, api *client.Client, accountHint string, args []string, action string) error {
+	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
+		return fmt.Errorf("%s requires a VM name", action)
+	}
+	account, err := resolveAccount(api, accountHint)
+	if err != nil {
+		return err
+	}
+	vmName := strings.TrimSpace(args[0])
+
+	var vm client.VM
+	switch action {
+	case "poweron":
+		vm, err = api.PoweronVM(account.UUID, vmName)
+	case "poweroff":
+		vm, err = api.PoweroffVM(account.UUID, vmName)
+	case "kill":
+		vm, err = api.KillVM(account.UUID, vmName)
+	default:
+		return fmt.Errorf("unknown power action %q", action)
+	}
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "%s\t%s\tssh=%t\tweb=%t\n", vm.Name, vm.State, vm.SSHReady, vm.WebReady)
+	return err
+}
+
+func handleSSH(api *client.Client, accountHint string, args []string) error {
+	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
+		return errors.New("ssh requires a VM name")
+	}
+	account, err := resolveAccount(api, accountHint)
+	if err != nil {
+		return err
+	}
+	username, vmName := parseSSHVMTarget(args[0])
+	if vmName == "" {
+		return errors.New("ssh requires a VM name")
+	}
+	resolution, err := api.ResolveVM(account.UUID, vmName)
+	if err != nil {
+		return err
+	}
+	if !resolution.SSH.Ready {
+		return fmt.Errorf("vm %q is not SSH-ready yet", vmName)
+	}
+	return client.RunSSH(resolution, username)
+}
+
 func handlePort(w io.Writer, args []string, account string) error {
 	if len(args) == 0 {
 		return errors.New("port requires a subcommand")
@@ -149,4 +225,39 @@ func printable(value string) string {
 		return "<default>"
 	}
 	return value
+}
+
+func resolveAccount(api *client.Client, hint string) (client.Account, error) {
+	accounts, err := api.ListAccounts()
+	if err != nil {
+		return client.Account{}, err
+	}
+	if len(accounts) == 0 {
+		return client.Account{}, errors.New("no accounts available")
+	}
+	hint = strings.TrimSpace(hint)
+	if hint == "" {
+		if len(accounts) == 1 {
+			return accounts[0], nil
+		}
+		return client.Account{}, errors.New("multiple accounts available; use --account")
+	}
+	for _, account := range accounts {
+		if account.UUID == hint || strings.EqualFold(account.Name, hint) {
+			return account, nil
+		}
+	}
+	return client.Account{}, fmt.Errorf("account %q not found", hint)
+}
+
+func parseSSHVMTarget(value string) (username string, vmName string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", ""
+	}
+	parts := strings.SplitN(value, "@", 2)
+	if len(parts) == 2 {
+		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	}
+	return "", value
 }

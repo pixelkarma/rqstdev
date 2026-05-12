@@ -6,6 +6,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -20,6 +24,28 @@ type Account struct {
 	UUID string `json:"uuid"`
 	Name string `json:"name"`
 	Role string `json:"role"`
+}
+
+type VM struct {
+	UUID         string `json:"uuid"`
+	Name         string `json:"name"`
+	State        string `json:"state"`
+	GuestWebPort int    `json:"guestWebPort"`
+	HostSSHPort  int    `json:"hostSSHPort"`
+	HostWebPort  int    `json:"hostWebPort"`
+	SSHReady     bool   `json:"sshReady"`
+	WebReady     bool   `json:"webReady"`
+	LastError    string `json:"lastError,omitempty"`
+}
+
+type SSHResolution struct {
+	VM  VM `json:"vm"`
+	SSH struct {
+		Host            string `json:"host"`
+		Port            int    `json:"port"`
+		DefaultUsername string `json:"defaultUsername"`
+		Ready           bool   `json:"ready"`
+	} `json:"ssh"`
 }
 
 type apiError struct {
@@ -57,6 +83,70 @@ func (c *Client) CreateAccount(name string) (Account, error) {
 		return Account{}, err
 	}
 	return resp.Account, nil
+}
+
+func (c *Client) ListVMs(accountUUID string) ([]VM, error) {
+	var resp struct {
+		VMs []VM `json:"vms"`
+	}
+	path := fmt.Sprintf("/v1/accounts/%s/vms", url.PathEscape(strings.TrimSpace(accountUUID)))
+	if err := c.doJSON(http.MethodGet, path, nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.VMs, nil
+}
+
+func (c *Client) ResolveVM(accountUUID, vmName string) (SSHResolution, error) {
+	var resp SSHResolution
+	path := fmt.Sprintf("/v1/accounts/%s/resolve-vm/%s", url.PathEscape(strings.TrimSpace(accountUUID)), url.PathEscape(strings.TrimSpace(vmName)))
+	if err := c.doJSON(http.MethodGet, path, nil, &resp); err != nil {
+		return SSHResolution{}, err
+	}
+	return resp, nil
+}
+
+func (c *Client) PoweroffVM(accountUUID, vmName string) (VM, error) {
+	return c.vmAction(accountUUID, vmName, "poweroff")
+}
+
+func (c *Client) KillVM(accountUUID, vmName string) (VM, error) {
+	return c.vmAction(accountUUID, vmName, "kill")
+}
+
+func (c *Client) PoweronVM(accountUUID, vmName string) (VM, error) {
+	return c.vmAction(accountUUID, vmName, "poweron")
+}
+
+func RunSSH(resolution SSHResolution, username string) error {
+	targetUser := strings.TrimSpace(username)
+	if targetUser == "" {
+		targetUser = resolution.SSH.DefaultUsername
+	}
+	target := resolution.SSH.Host
+	if targetUser != "" {
+		target = targetUser + "@" + target
+	}
+	cmd := exec.Command(
+		"ssh",
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-p", strconv.Itoa(resolution.SSH.Port),
+		target,
+	)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func (c *Client) vmAction(accountUUID, vmName, action string) (VM, error) {
+	var resp struct {
+		VM VM `json:"vm"`
+	}
+	path := fmt.Sprintf("/v1/accounts/%s/vms/%s/%s", url.PathEscape(strings.TrimSpace(accountUUID)), url.PathEscape(strings.TrimSpace(vmName)), action)
+	if err := c.doJSON(http.MethodPost, path, map[string]any{}, &resp); err != nil {
+		return VM{}, err
+	}
+	return resp.VM, nil
 }
 
 func (c *Client) doJSON(method, path string, reqBody any, out any) error {

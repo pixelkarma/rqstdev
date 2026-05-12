@@ -1,12 +1,20 @@
 package vmruntime
 
 import (
+	"bufio"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"syscall"
+	"time"
 
 	"rqstdev/api/internal/config"
 	"rqstdev/api/internal/store"
@@ -76,7 +84,7 @@ func (rt Runtime) StartVM(vm store.VM, files Files, cpuCount, memoryMB int) erro
 	_ = os.Remove(files.QMPSocketPath)
 
 	nic := fmt.Sprintf(
-		"user,hostfwd=tcp:127.0.0.1:%d-:22,hostfwd=tcp:127.0.0.1:%d-:%d",
+		"user,hostfwd=tcp::%d-:22,hostfwd=tcp:127.0.0.1:%d-:%d",
 		vm.HostSSHPort,
 		vm.HostWebPort,
 		vm.GuestWebPort,
@@ -104,6 +112,81 @@ func (rt Runtime) StartVM(vm store.VM, files Files, cpuCount, memoryMB int) erro
 		return fmt.Errorf("start qemu: %w: %s", err, string(output))
 	}
 	return nil
+}
+
+func (rt Runtime) StartExistingVM(vm store.VM) error {
+	files := Files{
+		RuntimeDir:    vm.RuntimeDir,
+		DiskImagePath: vm.DiskImagePath,
+		PIDFilePath:   vm.PIDFilePath,
+		QMPSocketPath: vm.QMPSocketPath,
+		SerialLogPath: vm.SerialLogPath,
+	}
+	return rt.StartVM(vm, files, vm.CPUCount, vm.MemoryMB)
+}
+
+func (rt Runtime) PoweroffVM(vm store.VM) error {
+	conn, err := net.DialTimeout("unix", vm.QMPSocketPath, 3*time.Second)
+	if err != nil {
+		return fmt.Errorf("connect qmp socket: %w", err)
+	}
+	defer conn.Close()
+
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return fmt.Errorf("set qmp deadline: %w", err)
+	}
+
+	reader := bufio.NewReader(conn)
+	if _, err := reader.ReadBytes('\n'); err != nil {
+		return fmt.Errorf("read qmp greeting: %w", err)
+	}
+	for _, execute := range []string{"qmp_capabilities", "system_powerdown"} {
+		if err := writeQMPCommand(conn, execute); err != nil {
+			return err
+		}
+		if err := readQMPReply(reader, execute); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (rt Runtime) KillVM(vm store.VM) error {
+	pid, err := readPID(vm.PIDFilePath)
+	if err != nil {
+		return err
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("find qemu process: %w", err)
+	}
+	if err := process.Signal(syscall.SIGKILL); err != nil {
+		return fmt.Errorf("kill qemu process: %w", err)
+	}
+	return nil
+}
+
+func (rt Runtime) WaitForSSHReady(port int, timeout time.Duration) bool {
+	return waitForTCP("127.0.0.1:"+strconv.Itoa(port), timeout)
+}
+
+func (rt Runtime) WaitForSSHClosed(port int, timeout time.Duration) bool {
+	return waitForTCPClosed("127.0.0.1:"+strconv.Itoa(port), timeout)
+}
+
+func (rt Runtime) ProbeWebReady(port int, timeout time.Duration) bool {
+	client := http.Client{Timeout: 2 * time.Second}
+	deadline := time.Now().Add(timeout)
+	url := "http://127.0.0.1:" + strconv.Itoa(port) + "/"
+	for time.Now().Before(deadline) {
+		res, err := client.Get(url)
+		if err == nil {
+			_ = res.Body.Close()
+			return true
+		}
+		time.Sleep(2 * time.Second)
+	}
+	return false
 }
 
 func (rt Runtime) NginxSnippetPath(vmName string) string {
@@ -150,4 +233,101 @@ func (rt Runtime) ReloadNginx() error {
 	}
 
 	return fmt.Errorf("reload nginx: %w", lastErr)
+}
+
+func waitForTCP(address string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		dialTimeout := tcpProbeTimeout(time.Until(deadline))
+		conn, err := net.DialTimeout("tcp", address, dialTimeout)
+		if err == nil {
+			_ = conn.Close()
+			return true
+		}
+		time.Sleep(tcpProbeSleep(time.Until(deadline)))
+	}
+	return false
+}
+
+func waitForTCPClosed(address string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		dialTimeout := tcpProbeTimeout(time.Until(deadline))
+		conn, err := net.DialTimeout("tcp", address, dialTimeout)
+		if err != nil {
+			return true
+		}
+		_ = conn.Close()
+		time.Sleep(tcpProbeSleep(time.Until(deadline)))
+	}
+	return false
+}
+
+func tcpProbeTimeout(remaining time.Duration) time.Duration {
+	if remaining <= 0 {
+		return 100 * time.Millisecond
+	}
+	if remaining < 500*time.Millisecond {
+		return remaining
+	}
+	return 500 * time.Millisecond
+}
+
+func tcpProbeSleep(remaining time.Duration) time.Duration {
+	if remaining <= 0 {
+		return 0
+	}
+	if remaining < 250*time.Millisecond {
+		return remaining
+	}
+	return 250 * time.Millisecond
+}
+
+func writeQMPCommand(conn net.Conn, execute string) error {
+	payload := map[string]any{"execute": execute}
+	if err := json.NewEncoder(conn).Encode(payload); err != nil {
+		return fmt.Errorf("write qmp %s: %w", execute, err)
+	}
+	return nil
+}
+
+func readQMPReply(reader *bufio.Reader, execute string) error {
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return fmt.Errorf("read qmp %s reply: %w", execute, err)
+		}
+		var reply map[string]any
+		if err := json.Unmarshal(line, &reply); err != nil {
+			continue
+		}
+		if eventName, ok := reply["event"].(string); ok && eventName != "" {
+			continue
+		}
+		if errValue, ok := reply["error"]; ok && errValue != nil {
+			return fmt.Errorf("qmp %s failed: %v", execute, errValue)
+		}
+		if _, ok := reply["return"]; ok {
+			return nil
+		}
+	}
+}
+
+func readPID(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, fmt.Errorf("pid file not found")
+		}
+		return 0, fmt.Errorf("read pid file: %w", err)
+	}
+	value := strings.TrimSpace(string(data))
+	if value == "" {
+		return 0, fmt.Errorf("pid file is empty")
+	}
+	pid, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("parse pid file: %w", err)
+	}
+	return pid, nil
 }

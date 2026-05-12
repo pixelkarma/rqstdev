@@ -60,16 +60,25 @@ type Template struct {
 }
 
 type VM struct {
-	ID           int64  `json:"-"`
-	UUID         string `json:"uuid"`
-	Name         string `json:"name"`
-	AccountUUID  string `json:"accountUUID,omitempty"`
-	TemplateUUID string `json:"templateUUID,omitempty"`
-	State        string `json:"state"`
-	GuestWebPort int    `json:"guestWebPort"`
-	HostSSHPort  int    `json:"hostSSHPort"`
-	HostWebPort  int    `json:"hostWebPort"`
-	LastError    string `json:"lastError,omitempty"`
+	ID            int64  `json:"-"`
+	UUID          string `json:"uuid"`
+	Name          string `json:"name"`
+	AccountUUID   string `json:"accountUUID,omitempty"`
+	TemplateUUID  string `json:"templateUUID,omitempty"`
+	State         string `json:"state"`
+	GuestWebPort  int    `json:"guestWebPort"`
+	HostSSHPort   int    `json:"hostSSHPort"`
+	HostWebPort   int    `json:"hostWebPort"`
+	SSHReady      bool   `json:"sshReady"`
+	WebReady      bool   `json:"webReady"`
+	LastError     string `json:"lastError,omitempty"`
+	CPUCount      int    `json:"-"`
+	MemoryMB      int    `json:"-"`
+	RuntimeDir    string `json:"-"`
+	DiskImagePath string `json:"-"`
+	PIDFilePath   string `json:"-"`
+	QMPSocketPath string `json:"-"`
+	SerialLogPath string `json:"-"`
 }
 
 type SignupParams struct {
@@ -133,6 +142,18 @@ func initDB(db *sql.DB) error {
 	for _, stmt := range schemaStatements {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("run migration: %w", err)
+		}
+	}
+	for _, migration := range []struct {
+		table      string
+		column     string
+		definition string
+	}{
+		{table: "vms", column: "ssh_ready", definition: "INTEGER NOT NULL DEFAULT 0 CHECK (ssh_ready IN (0,1))"},
+		{table: "vms", column: "web_ready", definition: "INTEGER NOT NULL DEFAULT 0 CHECK (web_ready IN (0,1))"},
+	} {
+		if err := ensureColumn(ctx, db, migration.table, migration.column, migration.definition); err != nil {
+			return err
 		}
 	}
 	if err := db.PingContext(ctx); err != nil {
@@ -212,6 +233,8 @@ var schemaStatements = []string{
 		account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
 		template_id INTEGER NOT NULL REFERENCES vm_templates(id) ON DELETE RESTRICT,
 		state TEXT NOT NULL CHECK (state IN ('creating', 'running', 'stopped', 'deleting', 'error')),
+		ssh_ready INTEGER NOT NULL DEFAULT 0 CHECK (ssh_ready IN (0,1)),
+		web_ready INTEGER NOT NULL DEFAULT 0 CHECK (web_ready IN (0,1)),
 		guest_ip_address TEXT,
 		guest_web_port INTEGER NOT NULL DEFAULT 80,
 		cpu_count INTEGER NOT NULL,
@@ -241,6 +264,39 @@ var schemaStatements = []string{
 	`CREATE INDEX IF NOT EXISTS idx_vm_templates_account_active ON vm_templates(account_id, active);`,
 	`CREATE INDEX IF NOT EXISTS idx_vms_account_id ON vms(account_id);`,
 	`CREATE INDEX IF NOT EXISTS idx_vms_state ON vms(state);`,
+}
+
+func ensureColumn(ctx context.Context, db *sql.DB, table, column, definition string) error {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return fmt.Errorf("inspect %s columns: %w", table, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			columnType string
+			notNull    int
+			defaultVal sql.NullString
+			primaryKey int
+		)
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultVal, &primaryKey); err != nil {
+			return fmt.Errorf("scan %s column info: %w", table, err)
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate %s columns: %w", table, err)
+	}
+
+	if _, err := db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+column+" "+definition); err != nil {
+		return fmt.Errorf("add %s.%s: %w", table, column, err)
+	}
+	return nil
 }
 
 func (s *Store) CreateUserWithAccount(ctx context.Context, params SignupParams) (User, string, error) {
@@ -582,10 +638,10 @@ func (s *Store) CreateVM(ctx context.Context, params CreateVMParams) (VM, error)
 	now := utcNow()
 	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO vms (
-			uuid, name, account_id, template_id, state, guest_ip_address, guest_web_port,
+			uuid, name, account_id, template_id, state, ssh_ready, web_ready, guest_ip_address, guest_web_port,
 			cpu_count, memory_mb, runtime_dir, disk_image_path, pid_file_path, qmp_socket_path,
 			serial_log_path, last_error, created_at, updated_at
-		) VALUES (?, ?, ?, ?, 'creating', '', ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+		) VALUES (?, ?, ?, ?, 'creating', 0, 0, '', ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
 	`, params.UUID, name, params.AccountID, params.TemplateID, params.GuestWebPort, params.CPUCount, params.MemoryMB,
 		params.RuntimeDir, params.DiskImagePath, params.PIDFilePath, params.QMPSocketPath, params.SerialLogPath, now, now)
 	if err != nil {
@@ -601,15 +657,24 @@ func (s *Store) CreateVM(ctx context.Context, params CreateVMParams) (VM, error)
 	}
 
 	return VM{
-		ID:           vmID,
-		UUID:         params.UUID,
-		Name:         name,
-		AccountUUID:  params.AccountUUID,
-		TemplateUUID: params.TemplateUUID,
-		State:        "creating",
-		GuestWebPort: params.GuestWebPort,
-		HostSSHPort:  HostSSHPort(vmID),
-		HostWebPort:  HostWebPort(vmID),
+		ID:            vmID,
+		UUID:          params.UUID,
+		Name:          name,
+		AccountUUID:   params.AccountUUID,
+		TemplateUUID:  params.TemplateUUID,
+		State:         "creating",
+		GuestWebPort:  params.GuestWebPort,
+		HostSSHPort:   HostSSHPort(vmID),
+		HostWebPort:   HostWebPort(vmID),
+		SSHReady:      false,
+		WebReady:      false,
+		CPUCount:      params.CPUCount,
+		MemoryMB:      params.MemoryMB,
+		RuntimeDir:    params.RuntimeDir,
+		DiskImagePath: params.DiskImagePath,
+		PIDFilePath:   params.PIDFilePath,
+		QMPSocketPath: params.QMPSocketPath,
+		SerialLogPath: params.SerialLogPath,
 	}, nil
 }
 
@@ -625,9 +690,21 @@ func (s *Store) UpdateVMState(ctx context.Context, vmID int64, state, lastError 
 	return nil
 }
 
+func (s *Store) UpdateVMReadiness(ctx context.Context, vmID int64, sshReady, webReady bool) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE vms
+		SET ssh_ready = ?, web_ready = ?, updated_at = ?
+		WHERE id = ?
+	`, boolToInt(sshReady), boolToInt(webReady), utcNow(), vmID)
+	if err != nil {
+		return fmt.Errorf("update vm readiness: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) VMsForAccount(ctx context.Context, accountID int64, accountUUID string) ([]VM, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, uuid, name, state, guest_web_port, COALESCE(last_error, '')
+		SELECT id, uuid, name, state, ssh_ready, web_ready, guest_web_port, COALESCE(last_error, '')
 		FROM vms
 		WHERE account_id = ?
 		ORDER BY created_at ASC, id ASC
@@ -640,10 +717,13 @@ func (s *Store) VMsForAccount(ctx context.Context, accountID int64, accountUUID 
 	var vms []VM
 	for rows.Next() {
 		var vm VM
-		if err := rows.Scan(&vm.ID, &vm.UUID, &vm.Name, &vm.State, &vm.GuestWebPort, &vm.LastError); err != nil {
+		var sshReadyInt, webReadyInt int
+		if err := rows.Scan(&vm.ID, &vm.UUID, &vm.Name, &vm.State, &sshReadyInt, &webReadyInt, &vm.GuestWebPort, &vm.LastError); err != nil {
 			return nil, fmt.Errorf("scan vm: %w", err)
 		}
 		vm.AccountUUID = accountUUID
+		vm.SSHReady = sshReadyInt == 1
+		vm.WebReady = webReadyInt == 1
 		vm.HostSSHPort = HostSSHPort(vm.ID)
 		vm.HostWebPort = HostWebPort(vm.ID)
 		vms = append(vms, vm)
@@ -652,6 +732,48 @@ func (s *Store) VMsForAccount(ctx context.Context, accountID int64, accountUUID 
 		return nil, fmt.Errorf("iterate vms: %w", err)
 	}
 	return vms, nil
+}
+
+func (s *Store) VMForAccountByName(ctx context.Context, accountID int64, accountUUID, vmName string) (VM, error) {
+	var vm VM
+	var sshReadyInt, webReadyInt int
+	row := s.db.QueryRowContext(ctx, `
+		SELECT
+			id, uuid, name, state, ssh_ready, web_ready, guest_web_port,
+			cpu_count, memory_mb, runtime_dir, disk_image_path, pid_file_path,
+			qmp_socket_path, serial_log_path, COALESCE(last_error, '')
+		FROM vms
+		WHERE account_id = ? AND name = ?
+		LIMIT 1
+	`, accountID, strings.TrimSpace(vmName))
+	if err := row.Scan(
+		&vm.ID,
+		&vm.UUID,
+		&vm.Name,
+		&vm.State,
+		&sshReadyInt,
+		&webReadyInt,
+		&vm.GuestWebPort,
+		&vm.CPUCount,
+		&vm.MemoryMB,
+		&vm.RuntimeDir,
+		&vm.DiskImagePath,
+		&vm.PIDFilePath,
+		&vm.QMPSocketPath,
+		&vm.SerialLogPath,
+		&vm.LastError,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return VM{}, ErrNotFound
+		}
+		return VM{}, fmt.Errorf("lookup vm: %w", err)
+	}
+	vm.AccountUUID = accountUUID
+	vm.SSHReady = sshReadyInt == 1
+	vm.WebReady = webReadyInt == 1
+	vm.HostSSHPort = HostSSHPort(vm.ID)
+	vm.HostWebPort = HostWebPort(vm.ID)
+	return vm, nil
 }
 
 func HostSSHPort(vmID int64) int {
@@ -701,4 +823,11 @@ func isConstraintErr(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "unique") || strings.Contains(msg, "constraint")
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
