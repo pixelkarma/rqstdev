@@ -31,13 +31,6 @@ Runtime assumptions:
 - `rqstdev-api` can bind its configured listen address
 - `rqstdev-api` can also bind additional published web ports on the host when users enable them
 
-What is not required:
-
-- Docker
-- cloud-init
-- a separate database server
-- app-managed `nginx` snippets
-
 ## Build Commands
 
 Workspace build:
@@ -246,4 +239,3 @@ Current runtime files include:
 - VM web services are user-managed inside the guest
 - `rqstdev` does not automatically provision a web server inside the VM
 - SSH access is through the CLI path, for example `rqstdev ssh myvm`
-- the server is currently single-host only
