@@ -21,10 +21,11 @@ import (
 )
 
 type Server struct {
-	http  *http.Server
-	cfg   config.Config
-	store *store.Store
-	vmrt  vmruntime.Runtime
+	http   *http.Server
+	cfg    config.Config
+	store  *store.Store
+	vmrt   vmruntime.Runtime
+	router *routeManager
 }
 
 type statusResponse struct {
@@ -34,9 +35,10 @@ type statusResponse struct {
 }
 
 type authHandler struct {
-	cfg   config.Config
-	store *store.Store
-	vmrt  vmruntime.Runtime
+	cfg    config.Config
+	store  *store.Store
+	vmrt   vmruntime.Runtime
+	router *routeManager
 }
 
 type signupRequest struct {
@@ -119,15 +121,30 @@ func New(cfg config.Config, logger *log.Logger, st *store.Store) *Server {
 	mux := http.NewServeMux()
 
 	srv := &Server{
-		cfg:   cfg,
-		store: st,
-		vmrt:  vmruntime.New(cfg),
+		cfg:    cfg,
+		store:  st,
+		vmrt:   vmruntime.New(cfg),
+		router: newRouteManager(cfg, st, logger),
 	}
 	registerRoutes(mux, srv)
 
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := normalizeHost(r.Host)
+		if host == "" || host == srv.router.apiHost {
+			if strings.HasPrefix(r.URL.Path, "/v1/") || r.URL.Path == "/v1" || r.URL.Path == "/healthz" {
+				mux.ServeHTTP(w, r)
+				return
+			}
+		}
+		if srv.router.serveRoutedRequest(w, r, 0) {
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+
 	srv.http = &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           loggingMiddleware(logger, mux),
+		Handler:           loggingMiddleware(logger, handler),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -135,15 +152,46 @@ func New(cfg config.Config, logger *log.Logger, st *store.Store) *Server {
 }
 
 func (s *Server) ListenAndServe() error {
+	if err := s.router.start(context.Background()); err != nil {
+		return err
+	}
+	if err := s.reconcileRuntimeState(context.Background()); err != nil {
+		return err
+	}
 	return s.http.ListenAndServe()
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
+	if err := s.router.shutdown(ctx); err != nil {
+		return err
+	}
 	return s.http.Shutdown(ctx)
 }
 
+func (s *Server) reconcileRuntimeState(ctx context.Context) error {
+	vms, err := s.store.AllVMs(ctx)
+	if err != nil {
+		return err
+	}
+	for _, vm := range vms {
+		if !s.vmrt.IsVMRunning(vm) {
+			_ = s.store.UpdateVMReadiness(ctx, vm.ID, false, false)
+			_ = s.store.UpdateVMState(ctx, vm.ID, "stopped", "")
+			continue
+		}
+		ports, err := s.store.PublishedPortsForVM(ctx, vm.ID)
+		if err != nil {
+			return err
+		}
+		for _, port := range ports {
+			_ = s.vmrt.StartPublishedPort(vm, port.BackendPort, port.GuestPort)
+		}
+	}
+	return nil
+}
+
 func registerRoutes(mux *http.ServeMux, srv *Server) {
-	auth := authHandler{cfg: srv.cfg, store: srv.store, vmrt: srv.vmrt}
+	auth := authHandler{cfg: srv.cfg, store: srv.store, vmrt: srv.vmrt, router: srv.router}
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, statusResponse{
@@ -717,16 +765,7 @@ func (h authHandler) handleVMCreate(w http.ResponseWriter, r *http.Request, scop
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to start VM.")
 		return
 	}
-	if err := h.vmrt.WriteNginxSnippet(vm); err != nil {
-		_ = h.store.UpdateVMState(r.Context(), vm.ID, "error", err.Error())
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to write nginx configuration.")
-		return
-	}
-	if err := h.vmrt.ReloadNginx(); err != nil {
-		_ = h.store.UpdateVMState(r.Context(), vm.ID, "error", err.Error())
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to reload nginx.")
-		return
-	}
+	h.router.addVM(vm)
 	go h.monitorVMReadiness(vm)
 	writeJSON(w, http.StatusCreated, map[string]any{"vm": vm})
 }
@@ -921,26 +960,41 @@ func (h authHandler) handleVMPortAdd(w http.ResponseWriter, r *http.Request, sco
 		writeError(w, http.StatusBadRequest, "validation_error", err.Error())
 		return
 	}
-	if req.PublicPort <= 0 || req.GuestPort <= 0 {
-		writeError(w, http.StatusBadRequest, "validation_error", "publicPort and guestPort are required")
+	switch {
+	case req.PublicPort < 1024 || req.PublicPort > 65535:
+		writeError(w, http.StatusBadRequest, "validation_error", "publicPort must be between 1024 and 65535")
+		return
+	case req.PublicPort == 80 || req.PublicPort == 443:
+		writeError(w, http.StatusBadRequest, "validation_error", "publicPort 80 and 443 are reserved for default web routing")
+		return
+	case req.GuestPort <= 0 || req.GuestPort > 65535:
+		writeError(w, http.StatusBadRequest, "validation_error", "guestPort must be between 1 and 65535")
 		return
 	}
 	port, err := h.store.AddPublishedPort(r.Context(), vm.ID, req.PublicPort, req.GuestPort)
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrConflict):
-			writeError(w, http.StatusConflict, "conflict", "That public port is already in use.")
+			writeError(w, http.StatusConflict, "conflict", "That public port is already published for this VM.")
 		default:
 			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to save published port.")
 		}
 		return
 	}
 	if vm.SSHReady {
-		if err := h.vmrt.StartPublishedPort(vm, port.PublicPort, port.GuestPort); err != nil {
+		if err := h.vmrt.StartPublishedPort(vm, port.BackendPort, port.GuestPort); err != nil {
 			_ = h.store.RemovePublishedPort(r.Context(), vm.ID, port.PublicPort)
 			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to publish port.")
 			return
 		}
+	}
+	if err := h.router.addPublishedPort(vm, port); err != nil {
+		if vm.SSHReady {
+			_ = h.vmrt.StopPublishedPort(vm, port.BackendPort)
+		}
+		_ = h.store.RemovePublishedPort(r.Context(), vm.ID, port.PublicPort)
+		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to activate published port.")
+		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"port": port})
 }
@@ -964,9 +1018,11 @@ func (h authHandler) handleVMPortRemove(w http.ResponseWriter, r *http.Request, 
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load published ports.")
 		return
 	}
+	var target *store.PublishedPort
 	for _, port := range ports {
 		if port.PublicPort == publicPort {
-			_ = h.vmrt.StopPublishedPort(vm, port.PublicPort)
+			portCopy := port
+			target = &portCopy
 			break
 		}
 	}
@@ -978,6 +1034,10 @@ func (h authHandler) handleVMPortRemove(w http.ResponseWriter, r *http.Request, 
 			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to remove published port.")
 		}
 		return
+	}
+	if target != nil {
+		_ = h.vmrt.StopPublishedPort(vm, target.BackendPort)
+		_ = h.router.removePublishedPort(vm, *target)
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -1019,7 +1079,7 @@ func (h authHandler) monitorVMReadiness(vm store.VM) {
 			webReady := h.vmrt.ProbeWebReady(vm.HostWebPort, 6*time.Second)
 			ports, _ := h.store.PublishedPortsForVM(context.Background(), vm.ID)
 			for _, port := range ports {
-				_ = h.vmrt.StartPublishedPort(vm, port.PublicPort, port.GuestPort)
+				_ = h.vmrt.StartPublishedPort(vm, port.BackendPort, port.GuestPort)
 			}
 			_ = h.store.UpdateVMReadiness(context.Background(), vm.ID, true, webReady)
 			_ = h.store.UpdateVMState(context.Background(), vm.ID, "running", "")
@@ -1034,7 +1094,7 @@ func (h authHandler) stopPublishedPorts(vm store.VM) error {
 		return err
 	}
 	for _, port := range ports {
-		if err := h.vmrt.StopPublishedPort(vm, port.PublicPort); err != nil {
+		if err := h.vmrt.StopPublishedPort(vm, port.BackendPort); err != nil {
 			return err
 		}
 	}
@@ -1042,16 +1102,11 @@ func (h authHandler) stopPublishedPorts(vm store.VM) error {
 }
 
 func (h authHandler) cleanupVM(ctx context.Context, vm store.VM) error {
+	ports, _ := h.store.PublishedPortsForVM(ctx, vm.ID)
 	_ = h.stopPublishedPorts(vm)
 	if h.vmrt.IsVMRunning(vm) {
 		_ = h.vmrt.KillVM(vm)
 		_ = h.vmrt.WaitForSSHClosed(vm.HostSSHPort, 10*time.Second)
-	}
-	if err := h.vmrt.RemoveNginxSnippet(vm.Name); err != nil {
-		return err
-	}
-	if err := h.vmrt.ReloadNginx(); err != nil {
-		return err
 	}
 	if err := h.vmrt.RemoveRuntimeDir(vm.RuntimeDir); err != nil {
 		return err
@@ -1059,7 +1114,7 @@ func (h authHandler) cleanupVM(ctx context.Context, vm store.VM) error {
 	if err := h.store.DeleteVM(ctx, vm.ID); err != nil {
 		return err
 	}
-	return nil
+	return h.router.removeVM(vm, ports)
 }
 
 func (h authHandler) refreshVMObservation(vm *store.VM) {

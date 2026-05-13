@@ -97,10 +97,19 @@ type VM struct {
 }
 
 type PublishedPort struct {
-	ID         int64  `json:"-"`
-	PublicPort int    `json:"publicPort"`
-	GuestPort  int    `json:"guestPort"`
-	Protocol   string `json:"protocol"`
+	ID          int64  `json:"-"`
+	PublicPort  int    `json:"publicPort"`
+	GuestPort   int    `json:"guestPort"`
+	BackendPort int    `json:"-"`
+	Protocol    string `json:"protocol"`
+}
+
+type PublishedRoute struct {
+	VM          VM
+	PublicPort  int
+	GuestPort   int
+	BackendPort int
+	Protocol    string
 }
 
 type SignupParams struct {
@@ -165,6 +174,9 @@ func initDB(db *sql.DB) error {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("run migration: %w", err)
 		}
+	}
+	if err := migratePublishedPorts(ctx, db); err != nil {
+		return err
 	}
 	for _, migration := range []struct {
 		table      string
@@ -273,10 +285,12 @@ var schemaStatements = []string{
 	`CREATE TABLE IF NOT EXISTS published_ports (
 		id INTEGER PRIMARY KEY,
 		vm_id INTEGER NOT NULL REFERENCES vms(id) ON DELETE CASCADE,
-		public_port INTEGER NOT NULL UNIQUE,
+		public_port INTEGER NOT NULL,
 		guest_port INTEGER NOT NULL,
-		protocol TEXT NOT NULL DEFAULT 'tcp' CHECK (protocol = 'tcp'),
-		created_at TEXT NOT NULL
+		backend_port INTEGER NOT NULL UNIQUE,
+		protocol TEXT NOT NULL DEFAULT 'http' CHECK (protocol = 'http'),
+		created_at TEXT NOT NULL,
+		UNIQUE(vm_id, public_port)
 	);`,
 	`CREATE INDEX IF NOT EXISTS idx_account_users_user_id ON account_users(user_id);`,
 	`CREATE INDEX IF NOT EXISTS idx_account_users_account_role ON account_users(account_id, role);`,
@@ -286,6 +300,100 @@ var schemaStatements = []string{
 	`CREATE INDEX IF NOT EXISTS idx_vm_templates_account_active ON vm_templates(account_id, active);`,
 	`CREATE INDEX IF NOT EXISTS idx_vms_account_id ON vms(account_id);`,
 	`CREATE INDEX IF NOT EXISTS idx_vms_state ON vms(state);`,
+}
+
+func migratePublishedPorts(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info(published_ports)")
+	if err != nil {
+		return fmt.Errorf("inspect published_ports: %w", err)
+	}
+	defer rows.Close()
+
+	columns := map[string]bool{}
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			columnType string
+			notNull    int
+			defaultVal sql.NullString
+			primaryKey int
+		)
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultVal, &primaryKey); err != nil {
+			return fmt.Errorf("scan published_ports info: %w", err)
+		}
+		columns[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate published_ports info: %w", err)
+	}
+	if len(columns) == 0 || columns["backend_port"] {
+		return nil
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin published_ports migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE published_ports RENAME TO published_ports_old`); err != nil {
+		return fmt.Errorf("rename published_ports: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE published_ports (
+		id INTEGER PRIMARY KEY,
+		vm_id INTEGER NOT NULL REFERENCES vms(id) ON DELETE CASCADE,
+		public_port INTEGER NOT NULL,
+		guest_port INTEGER NOT NULL,
+		backend_port INTEGER NOT NULL UNIQUE,
+		protocol TEXT NOT NULL DEFAULT 'http' CHECK (protocol = 'http'),
+		created_at TEXT NOT NULL,
+		UNIQUE(vm_id, public_port)
+	)`); err != nil {
+		return fmt.Errorf("create migrated published_ports: %w", err)
+	}
+
+	oldRows, err := tx.QueryContext(ctx, `
+		SELECT id, vm_id, public_port, guest_port, created_at
+		FROM published_ports_old
+		ORDER BY id ASC
+	`)
+	if err != nil {
+		return fmt.Errorf("query legacy published ports: %w", err)
+	}
+	defer oldRows.Close()
+
+	nextBackend := 32000
+	for oldRows.Next() {
+		var (
+			id         int64
+			vmID       int64
+			publicPort int
+			guestPort  int
+			createdAt  string
+		)
+		if err := oldRows.Scan(&id, &vmID, &publicPort, &guestPort, &createdAt); err != nil {
+			return fmt.Errorf("scan legacy published port: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO published_ports (id, vm_id, public_port, guest_port, backend_port, protocol, created_at)
+			VALUES (?, ?, ?, ?, ?, 'http', ?)
+		`, id, vmID, publicPort, guestPort, nextBackend, createdAt); err != nil {
+			return fmt.Errorf("copy legacy published port: %w", err)
+		}
+		nextBackend++
+	}
+	if err := oldRows.Err(); err != nil {
+		return fmt.Errorf("iterate legacy published ports: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `DROP TABLE published_ports_old`); err != nil {
+		return fmt.Errorf("drop legacy published_ports: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit published_ports migration: %w", err)
+	}
+	return nil
 }
 
 func ensureColumn(ctx context.Context, db *sql.DB, table, column, definition string) error {
@@ -1172,6 +1280,57 @@ func (s *Store) DeleteVM(ctx context.Context, vmID int64) error {
 	return nil
 }
 
+func (s *Store) AllVMs(ctx context.Context) ([]VM, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT
+			v.id, v.uuid, v.name, a.uuid, v.state, v.ssh_ready, v.web_ready, v.guest_web_port,
+			v.cpu_count, v.memory_mb, v.runtime_dir, v.disk_image_path, v.pid_file_path,
+			v.qmp_socket_path, v.serial_log_path, COALESCE(v.last_error, '')
+		FROM vms v
+		JOIN accounts a ON a.id = v.account_id
+		ORDER BY v.id ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("query all vms: %w", err)
+	}
+	defer rows.Close()
+
+	var vms []VM
+	for rows.Next() {
+		var vm VM
+		var sshReadyInt, webReadyInt int
+		if err := rows.Scan(
+			&vm.ID,
+			&vm.UUID,
+			&vm.Name,
+			&vm.AccountUUID,
+			&vm.State,
+			&sshReadyInt,
+			&webReadyInt,
+			&vm.GuestWebPort,
+			&vm.CPUCount,
+			&vm.MemoryMB,
+			&vm.RuntimeDir,
+			&vm.DiskImagePath,
+			&vm.PIDFilePath,
+			&vm.QMPSocketPath,
+			&vm.SerialLogPath,
+			&vm.LastError,
+		); err != nil {
+			return nil, fmt.Errorf("scan all vm: %w", err)
+		}
+		vm.SSHReady = sshReadyInt == 1
+		vm.WebReady = webReadyInt == 1
+		vm.HostSSHPort = HostSSHPort(vm.ID)
+		vm.HostWebPort = HostWebPort(vm.ID)
+		vms = append(vms, vm)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate all vms: %w", err)
+	}
+	return vms, nil
+}
+
 func (s *Store) VMsForAccount(ctx context.Context, accountID int64, accountUUID string) ([]VM, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, uuid, name, state, ssh_ready, web_ready, guest_web_port, COALESCE(last_error, '')
@@ -1248,7 +1407,7 @@ func (s *Store) VMForAccountByName(ctx context.Context, accountID int64, account
 
 func (s *Store) PublishedPortsForVM(ctx context.Context, vmID int64) ([]PublishedPort, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, public_port, guest_port, protocol
+		SELECT id, public_port, guest_port, backend_port, protocol
 		FROM published_ports
 		WHERE vm_id = ?
 		ORDER BY public_port ASC
@@ -1261,7 +1420,7 @@ func (s *Store) PublishedPortsForVM(ctx context.Context, vmID int64) ([]Publishe
 	var ports []PublishedPort
 	for rows.Next() {
 		var port PublishedPort
-		if err := rows.Scan(&port.ID, &port.PublicPort, &port.GuestPort, &port.Protocol); err != nil {
+		if err := rows.Scan(&port.ID, &port.PublicPort, &port.GuestPort, &port.BackendPort, &port.Protocol); err != nil {
 			return nil, fmt.Errorf("scan published port: %w", err)
 		}
 		ports = append(ports, port)
@@ -1273,11 +1432,15 @@ func (s *Store) PublishedPortsForVM(ctx context.Context, vmID int64) ([]Publishe
 }
 
 func (s *Store) AddPublishedPort(ctx context.Context, vmID int64, publicPort, guestPort int) (PublishedPort, error) {
+	backendPort, err := s.nextBackendPort(ctx)
+	if err != nil {
+		return PublishedPort{}, err
+	}
 	now := utcNow()
 	result, err := s.db.ExecContext(ctx, `
-		INSERT INTO published_ports (vm_id, public_port, guest_port, protocol, created_at)
-		VALUES (?, ?, ?, 'tcp', ?)
-	`, vmID, publicPort, guestPort, now)
+		INSERT INTO published_ports (vm_id, public_port, guest_port, backend_port, protocol, created_at)
+		VALUES (?, ?, ?, ?, 'http', ?)
+	`, vmID, publicPort, guestPort, backendPort, now)
 	if err != nil {
 		if isConstraintErr(err) {
 			return PublishedPort{}, ErrConflict
@@ -1288,7 +1451,7 @@ func (s *Store) AddPublishedPort(ctx context.Context, vmID int64, publicPort, gu
 	if err != nil {
 		return PublishedPort{}, fmt.Errorf("read published port id: %w", err)
 	}
-	return PublishedPort{ID: portID, PublicPort: publicPort, GuestPort: guestPort, Protocol: "tcp"}, nil
+	return PublishedPort{ID: portID, PublicPort: publicPort, GuestPort: guestPort, BackendPort: backendPort, Protocol: "http"}, nil
 }
 
 func (s *Store) RemovePublishedPort(ctx context.Context, vmID int64, publicPort int) error {
@@ -1307,6 +1470,32 @@ func (s *Store) RemovePublishedPort(ctx context.Context, vmID int64, publicPort 
 		return ErrNotFound
 	}
 	return nil
+}
+
+func (s *Store) nextBackendPort(ctx context.Context) (int, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT backend_port FROM published_ports ORDER BY backend_port ASC`)
+	if err != nil {
+		return 0, fmt.Errorf("query backend ports: %w", err)
+	}
+	defer rows.Close()
+
+	next := 32000
+	for rows.Next() {
+		var used int
+		if err := rows.Scan(&used); err != nil {
+			return 0, fmt.Errorf("scan backend port: %w", err)
+		}
+		if used < next {
+			continue
+		}
+		if used == next {
+			next++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate backend ports: %w", err)
+	}
+	return next, nil
 }
 
 func (s *Store) respondInvite(ctx context.Context, userID int64, inviteUUID, status string) error {

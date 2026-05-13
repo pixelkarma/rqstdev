@@ -19,8 +19,6 @@ type Config struct {
 	DataDir                  string `json:"data_dir"`
 	VMsDir                   string `json:"vms_dir"`
 	QEMUBinaryPath           string `json:"qemu_binary_path"`
-	NginxBinaryPath          string `json:"nginx_binary_path"`
-	NginxSnippetDir          string `json:"nginx_snippet_dir"`
 	EmailScriptPath          string `json:"email_script_path"`
 	DefaultWebPort           int    `json:"default_web_port"`
 	DefaultSSHUser           string `json:"default_ssh_user"`
@@ -67,9 +65,6 @@ func applyDefaults(cfg *Config) {
 	if strings.TrimSpace(cfg.QEMUBinaryPath) == "" {
 		cfg.QEMUBinaryPath = "qemu-system-x86_64"
 	}
-	if strings.TrimSpace(cfg.NginxBinaryPath) == "" {
-		cfg.NginxBinaryPath = "nginx"
-	}
 	if strings.TrimSpace(cfg.VMsDir) == "" && strings.TrimSpace(cfg.DataDir) != "" {
 		cfg.VMsDir = filepath.Join(cfg.DataDir, "vms")
 	}
@@ -93,8 +88,6 @@ func validate(cfg Config) error {
 		return fmt.Errorf("data_dir is required")
 	case strings.TrimSpace(cfg.VMsDir) == "":
 		return fmt.Errorf("vms_dir is required")
-	case strings.TrimSpace(cfg.NginxSnippetDir) == "":
-		return fmt.Errorf("nginx_snippet_dir is required")
 	case strings.TrimSpace(cfg.DefaultTemplateImagePath) == "":
 		return fmt.Errorf("default_template_image_path is required")
 	}
@@ -102,7 +95,6 @@ func validate(cfg Config) error {
 	cfg.DBPath = filepath.Clean(cfg.DBPath)
 	cfg.DataDir = filepath.Clean(cfg.DataDir)
 	cfg.VMsDir = filepath.Clean(cfg.VMsDir)
-	cfg.NginxSnippetDir = filepath.Clean(cfg.NginxSnippetDir)
 
 	return nil
 }

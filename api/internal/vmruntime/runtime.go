@@ -21,11 +21,9 @@ import (
 )
 
 type Runtime struct {
-	QEMUBinaryPath  string
-	BaseDomain      string
-	VMsDir          string
-	NginxSnippetDir string
-	NginxBinaryPath string
+	QEMUBinaryPath string
+	BaseDomain     string
+	VMsDir         string
 }
 
 type Files struct {
@@ -38,11 +36,9 @@ type Files struct {
 
 func New(cfg config.Config) Runtime {
 	return Runtime{
-		QEMUBinaryPath:  cfg.QEMUBinaryPath,
-		BaseDomain:      cfg.BaseDomain,
-		VMsDir:          cfg.VMsDir,
-		NginxSnippetDir: cfg.NginxSnippetDir,
-		NginxBinaryPath: cfg.NginxBinaryPath,
+		QEMUBinaryPath: cfg.QEMUBinaryPath,
+		BaseDomain:     cfg.BaseDomain,
+		VMsDir:         cfg.VMsDir,
 	}
 }
 
@@ -167,7 +163,7 @@ func (rt Runtime) KillVM(vm store.VM) error {
 }
 
 func (rt Runtime) WaitForSSHReady(port int, timeout time.Duration) bool {
-	return waitForTCP("127.0.0.1:"+strconv.Itoa(port), timeout)
+	return waitForSSHBanner("127.0.0.1:"+strconv.Itoa(port), timeout)
 }
 
 func (rt Runtime) WaitForSSHClosed(port int, timeout time.Duration) bool {
@@ -187,17 +183,6 @@ func (rt Runtime) ProbeWebReady(port int, timeout time.Duration) bool {
 		time.Sleep(2 * time.Second)
 	}
 	return false
-}
-
-func (rt Runtime) NginxSnippetPath(vmName string) string {
-	return filepath.Join(rt.NginxSnippetDir, "rqstdev-"+vmName+".conf")
-}
-
-func (rt Runtime) RemoveNginxSnippet(vmName string) error {
-	if err := os.Remove(rt.NginxSnippetPath(vmName)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove nginx snippet: %w", err)
-	}
-	return nil
 }
 
 func (rt Runtime) RemoveRuntimeDir(runtimeDir string) error {
@@ -222,6 +207,9 @@ func (rt Runtime) IsVMRunning(vm store.VM) bool {
 func (rt Runtime) StartPublishedPort(vm store.VM, publicPort, guestPort int) error {
 	command := fmt.Sprintf("hostfwd_add tcp::%d-:%d", publicPort, guestPort)
 	if err := qmpHumanMonitorCommand(vm.QMPSocketPath, command); err != nil {
+		if strings.Contains(err.Error(), "already exists") {
+			return nil
+		}
 		return fmt.Errorf("add host forward: %w", err)
 	}
 	return nil
@@ -238,48 +226,6 @@ func (rt Runtime) StopPublishedPort(vm store.VM, publicPort int) error {
 	return nil
 }
 
-func (rt Runtime) WriteNginxSnippet(vm store.VM) error {
-	if err := os.MkdirAll(rt.NginxSnippetDir, 0o755); err != nil {
-		return fmt.Errorf("create nginx snippet dir: %w", err)
-	}
-	content := fmt.Sprintf(`server {
-    listen 80;
-    server_name %s.%s;
-
-    location / {
-        proxy_pass http://127.0.0.1:%d;
-        proxy_set_header Host $host;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-}
-`, vm.Name, rt.BaseDomain, vm.HostWebPort)
-	if err := os.WriteFile(rt.NginxSnippetPath(vm.Name), []byte(content), 0o644); err != nil {
-		return fmt.Errorf("write nginx snippet: %w", err)
-	}
-	return nil
-}
-
-func (rt Runtime) ReloadNginx() error {
-	commands := [][]string{
-		{"sudo", "systemctl", "reload", "nginx"},
-		{"sudo", rt.NginxBinaryPath, "-s", "reload"},
-		{rt.NginxBinaryPath, "-s", "reload"},
-	}
-
-	var lastErr error
-	for _, parts := range commands {
-		cmd := exec.Command(parts[0], parts[1:]...)
-		if output, err := cmd.CombinedOutput(); err == nil {
-			return nil
-		} else {
-			lastErr = fmt.Errorf("%s: %s", err, string(output))
-		}
-	}
-
-	return fmt.Errorf("reload nginx: %w", lastErr)
-}
-
 func waitForTCP(address string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -288,6 +234,25 @@ func waitForTCP(address string, timeout time.Duration) bool {
 		if err == nil {
 			_ = conn.Close()
 			return true
+		}
+		time.Sleep(tcpProbeSleep(time.Until(deadline)))
+	}
+	return false
+}
+
+func waitForSSHBanner(address string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		dialTimeout := tcpProbeTimeout(time.Until(deadline))
+		conn, err := net.DialTimeout("tcp", address, dialTimeout)
+		if err == nil {
+			_ = conn.SetReadDeadline(time.Now().Add(1500 * time.Millisecond))
+			buffer := make([]byte, 16)
+			n, readErr := conn.Read(buffer)
+			_ = conn.Close()
+			if readErr == nil && strings.HasPrefix(string(buffer[:n]), "SSH-") {
+				return true
+			}
 		}
 		time.Sleep(tcpProbeSleep(time.Until(deadline)))
 	}

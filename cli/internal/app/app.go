@@ -16,6 +16,7 @@ import (
 	"rqstdev/cli/internal/config"
 	"rqstdev/cli/internal/secret"
 	"rqstdev/cli/internal/session"
+	"rqstdev/cli/internal/sshcopy"
 	"rqstdev/cli/internal/tui"
 )
 
@@ -82,6 +83,8 @@ func run(w io.Writer, args []string) error {
 		return handlePowerAction(w, cfg, sess, api, *accountHint, rest[1:], "kill")
 	case "ssh":
 		return handleSSH(cfg, sess, api, *accountHint, rest[1:])
+	case "ssh-copy-id":
+		return handleSSHCopyID(w, cfg, sess, api, *accountHint, rest[1:])
 	case "port":
 		return handlePort(w, cfg, sess, api, *accountHint, rest[1:])
 	case "help":
@@ -134,7 +137,7 @@ func handleAuthenticatedRoot(w io.Writer, cfg config.Config, sess session.State,
 				return err
 			}
 		}
-		_, err = fmt.Fprintln(w, "\nCommands:\n  signup\n  login\n  logout\n  account\n  invites\n  list\n  add\n  delete\n  poweron\n  poweroff\n  kill\n  ssh\n  port")
+		_, err = fmt.Fprintln(w, "\nCommands:\n  signup\n  login\n  logout\n  account\n  invites\n  list\n  add\n  delete\n  poweron\n  poweroff\n  kill\n  ssh\n  ssh-copy-id\n  port")
 		return err
 	}
 	options := []tui.Option{
@@ -177,7 +180,7 @@ func handleAuthenticatedRoot(w io.Writer, cfg config.Config, sess session.State,
 func printRootHelp(w io.Writer, cfg config.Config, sess session.State) error {
 	_, err := fmt.Fprintf(
 		w,
-		"rqstdev CLI\n\nServer: %s\nCurrent account: %s\n\nCommands:\n  signup\n  login\n  logout\n  account\n  invites\n  list\n  add\n  delete\n  poweron\n  poweroff\n  kill\n  ssh\n  port\n",
+		"rqstdev CLI\n\nServer: %s\nCurrent account: %s\n\nCommands:\n  signup\n  login\n  logout\n  account\n  invites\n  list\n  add\n  delete\n  poweron\n  poweroff\n  kill\n  ssh\n  ssh-copy-id\n  port\n",
 		cfg.BaseURL,
 		currentAccountLabel(cfg, sess),
 	)
@@ -805,6 +808,52 @@ func handleSSH(cfg config.Config, sess session.State, api *client.Client, accoun
 	return client.RunSSH(resolution, username)
 }
 
+func handleSSHCopyID(w io.Writer, cfg config.Config, sess session.State, api *client.Client, accountHint string, args []string) error {
+	account, err := resolveAccount(cfg, sess, api, accountHint)
+	if err != nil {
+		return err
+	}
+	target := ""
+	if len(args) > 0 {
+		target = args[0]
+	}
+	username, vmName := parseSSHVMTarget(target)
+	if vmName == "" {
+		vmName, _, err = resolveVMArgument(api, account.UUID, nil)
+		if err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(username) == "" {
+		username = "root"
+	}
+	resolution, err := api.ResolveVM(account.UUID, vmName)
+	if err != nil {
+		return handleClientError(cfg.BaseURL, err)
+	}
+	if !resolution.SSH.Ready {
+		return fmt.Errorf("vm %q is not SSH-ready yet", vmName)
+	}
+
+	keyPath, err := selectPublicKeyPath()
+	if err != nil {
+		return err
+	}
+	publicKey, err := sshcopy.ReadPublicKey(keyPath)
+	if err != nil {
+		return err
+	}
+	password, err := guestPasswordInput(username, vmName)
+	if err != nil {
+		return err
+	}
+	if err := sshcopy.InstallPublicKey(resolution, username, password, publicKey); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "Installed %s on %s@%s\n", keyPath, username, vmName)
+	return err
+}
+
 func handlePort(w io.Writer, cfg config.Config, sess session.State, api *client.Client, accountHint string, args []string) error {
 	if len(args) == 0 {
 		return errors.New("port requires a subcommand")
@@ -1172,6 +1221,52 @@ func challengeInput(email, purpose string) (string, error) {
 	}
 	reader := bufio.NewReader(os.Stdin)
 	return prompt(reader, "Email code", "")
+}
+
+func guestPasswordInput(username, vmName string) (string, error) {
+	if tui.CanUse() {
+		values, err := tui.Inputs("Guest Password", []string{"Authenticate as " + username + " on " + vmName}, []tui.Field{{
+			Key:    "password",
+			Label:  "Password",
+			Secret: true,
+		}})
+		if err != nil {
+			return "", err
+		}
+		return values["password"], nil
+	}
+	return promptPassword("Guest password")
+}
+
+func selectPublicKeyPath() (string, error) {
+	keys, err := sshcopy.DiscoverPublicKeys()
+	if err != nil {
+		return "", err
+	}
+	if tui.CanUse() {
+		options := make([]tui.Option, 0, len(keys)+1)
+		for _, key := range keys {
+			options = append(options, tui.Option{Label: key.Label})
+		}
+		options = append(options, tui.Option{Label: "Enter custom path"})
+		index, err := tui.Select("Select a public key", []string{"Choose which public key to install."}, options, 0)
+		if err != nil {
+			return "", err
+		}
+		if index < len(keys) {
+			return keys[index].Path, nil
+		}
+		values, err := tui.Inputs("Custom Public Key Path", nil, []tui.Field{{Key: "path", Label: "Path"}})
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(values["path"]), nil
+	}
+	if len(keys) > 0 {
+		return keys[0].Path, nil
+	}
+	reader := bufio.NewReader(os.Stdin)
+	return prompt(reader, "Public key path", "")
 }
 
 func addInputs(vmName, templateName, guestPort string, templates []client.Template) (string, string, string, error) {
