@@ -1,5 +1,7 @@
 # rqstdev
 
+`rqstdev` is a lightweight single-host VM platform. It lets users create accounts, launch QEMU-based Linux VMs from a CLI, SSH into those VMs, and expose web services on per-VM subdomains and optional published web ports.
+
 `rqstdev` is a two-part system:
 
 - `api`: the single-host Linux server that manages accounts, QEMU VMs, and web routing
