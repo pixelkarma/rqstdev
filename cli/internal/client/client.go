@@ -53,10 +53,7 @@ type VM struct {
 	Name         string `json:"name"`
 	State        string `json:"state"`
 	GuestWebPort int    `json:"guestWebPort"`
-	HostSSHPort  int    `json:"hostSSHPort"`
-	HostWebPort  int    `json:"hostWebPort"`
 	SSHReady     bool   `json:"sshReady"`
-	WebReady     bool   `json:"webReady"`
 	LastError    string `json:"lastError,omitempty"`
 }
 

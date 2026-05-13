@@ -1076,12 +1076,11 @@ func (h authHandler) monitorVMReadiness(vm store.VM) {
 			if !h.vmrt.WaitForSSHReady(vm.HostSSHPort, 4*time.Second) {
 				continue
 			}
-			webReady := h.vmrt.ProbeWebReady(vm.HostWebPort, 6*time.Second)
 			ports, _ := h.store.PublishedPortsForVM(context.Background(), vm.ID)
 			for _, port := range ports {
 				_ = h.vmrt.StartPublishedPort(vm, port.BackendPort, port.GuestPort)
 			}
-			_ = h.store.UpdateVMReadiness(context.Background(), vm.ID, true, webReady)
+			_ = h.store.UpdateVMReadiness(context.Background(), vm.ID, true, false)
 			_ = h.store.UpdateVMState(context.Background(), vm.ID, "running", "")
 			return
 		}

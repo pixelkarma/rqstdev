@@ -124,7 +124,7 @@ func handleAuthenticatedRoot(w io.Writer, cfg config.Config, sess session.State,
 		if err == nil {
 			lines = append(lines, fmt.Sprintf("VMs in current account: %d", len(vms)))
 			for _, vm := range vms {
-				lines = append(lines, fmt.Sprintf("  %s\t%s\tssh=%t\tweb=%t", vm.Name, vm.State, vm.SSHReady, vm.WebReady))
+				lines = append(lines, fmt.Sprintf("  %s\t%s\tssh=%t", vm.Name, vm.State, vm.SSHReady))
 			}
 		}
 	}
@@ -661,7 +661,7 @@ func handleList(w io.Writer, cfg config.Config, sess session.State, api *client.
 		return err
 	}
 	for _, vm := range vms {
-		if _, err := fmt.Fprintf(w, "%s\t%s\tssh=%t\tweb=%t\tssh-port=%d\tweb-port=%d\n", vm.Name, vm.State, vm.SSHReady, vm.WebReady, vm.HostSSHPort, vm.HostWebPort); err != nil {
+		if _, err := fmt.Fprintf(w, "%s\t%s\tssh=%t\n", vm.Name, vm.State, vm.SSHReady); err != nil {
 			return err
 		}
 		if vm.LastError != "" {
@@ -728,7 +728,7 @@ func handleAdd(w io.Writer, cfg config.Config, sess session.State, api *client.C
 	if err != nil {
 		return handleClientError(cfg.BaseURL, err)
 	}
-	_, err = fmt.Fprintf(w, "Created VM %s (%s) state=%s ssh-port=%d web-port=%d\n", vm.Name, vm.UUID, vm.State, vm.HostSSHPort, vm.HostWebPort)
+	_, err = fmt.Fprintf(w, "Created VM %s (%s) state=%s\n", vm.Name, vm.UUID, vm.State)
 	return err
 }
 
@@ -778,7 +778,7 @@ func handlePowerAction(w io.Writer, cfg config.Config, sess session.State, api *
 	if err != nil {
 		return handleClientError(cfg.BaseURL, err)
 	}
-	_, err = fmt.Fprintf(w, "%s\t%s\tssh=%t\tweb=%t\n", vm.Name, vm.State, vm.SSHReady, vm.WebReady)
+	_, err = fmt.Fprintf(w, "%s\t%s\tssh=%t\n", vm.Name, vm.State, vm.SSHReady)
 	return err
 }
 
@@ -1459,7 +1459,7 @@ func selectVM(vms []client.VM) (string, error) {
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Fprintln(os.Stdout, "Select a VM:")
 	for i, vm := range vms {
-		fmt.Fprintf(os.Stdout, "  %d. %s\t%s\tssh=%t\tweb=%t\n", i+1, vm.Name, vm.State, vm.SSHReady, vm.WebReady)
+		fmt.Fprintf(os.Stdout, "  %d. %s\t%s\tssh=%t\n", i+1, vm.Name, vm.State, vm.SSHReady)
 	}
 	selection, err := prompt(reader, "VM number", "")
 	if err != nil {

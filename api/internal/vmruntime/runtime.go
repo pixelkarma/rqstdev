@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -168,21 +167,6 @@ func (rt Runtime) WaitForSSHReady(port int, timeout time.Duration) bool {
 
 func (rt Runtime) WaitForSSHClosed(port int, timeout time.Duration) bool {
 	return waitForTCPClosed("127.0.0.1:"+strconv.Itoa(port), timeout)
-}
-
-func (rt Runtime) ProbeWebReady(port int, timeout time.Duration) bool {
-	client := http.Client{Timeout: 2 * time.Second}
-	deadline := time.Now().Add(timeout)
-	url := "http://127.0.0.1:" + strconv.Itoa(port) + "/"
-	for time.Now().Before(deadline) {
-		res, err := client.Get(url)
-		if err == nil {
-			_ = res.Body.Close()
-			return true
-		}
-		time.Sleep(2 * time.Second)
-	}
-	return false
 }
 
 func (rt Runtime) RemoveRuntimeDir(runtimeDir string) error {

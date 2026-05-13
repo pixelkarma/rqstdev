@@ -82,11 +82,11 @@ type VM struct {
 	TemplateUUID  string `json:"templateUUID,omitempty"`
 	State         string `json:"state"`
 	GuestWebPort  int    `json:"guestWebPort"`
-	HostSSHPort   int    `json:"hostSSHPort"`
-	HostWebPort   int    `json:"hostWebPort"`
 	SSHReady      bool   `json:"sshReady"`
-	WebReady      bool   `json:"webReady"`
 	LastError     string `json:"lastError,omitempty"`
+	HostSSHPort   int    `json:"-"`
+	HostWebPort   int    `json:"-"`
+	WebReady      bool   `json:"-"`
 	CPUCount      int    `json:"-"`
 	MemoryMB      int    `json:"-"`
 	RuntimeDir    string `json:"-"`
