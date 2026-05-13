@@ -956,12 +956,28 @@ func handleClientError(baseURL string, err error) error {
 }
 
 func syncAccounts(cfg *config.Config, accounts []client.Account) error {
+	existingByUUID := make(map[string]config.AccountRef, len(cfg.Accounts))
+	for _, ref := range cfg.Accounts {
+		existingByUUID[ref.UUID] = ref
+	}
+
+	cfg.Accounts = map[string]config.AccountRef{}
 	for _, account := range accounts {
-		cfg.UpsertAccount(config.AccountRef{
+		ref := config.AccountRef{
 			UUID:    account.UUID,
 			Name:    account.Name,
 			BaseURL: cfg.BaseURL,
-		})
+		}
+		if existing, ok := existingByUUID[account.UUID]; ok {
+			ref.Alias = existing.Alias
+		}
+		cfg.UpsertAccount(ref)
+	}
+
+	if cfg.DefaultAccount != "" {
+		if _, _, ok := cfg.ResolveLocalAccount(cfg.DefaultAccount); !ok {
+			cfg.DefaultAccount = ""
+		}
 	}
 	if cfg.DefaultAccount == "" && len(cfg.Accounts) == 1 {
 		for alias := range cfg.Accounts {
@@ -993,18 +1009,33 @@ func resolveAccount(cfg config.Config, sess session.State, api *client.Client, h
 	}
 	if hint = strings.TrimSpace(hint); hint != "" {
 		if alias, ref, ok := cfg.ResolveLocalAccount(hint); ok {
-			return client.Account{UUID: ref.UUID, Name: ref.Name, Role: alias}, nil
+			for _, account := range accounts {
+				if account.UUID == ref.UUID {
+					if account.Role == "" {
+						account.Role = alias
+					}
+					return account, nil
+				}
+			}
 		}
 		return resolveRemoteAccount(accounts, hint)
 	}
 	if sess.ActiveAccount != "" {
 		if _, ref, ok := cfg.ResolveLocalAccount(sess.ActiveAccount); ok {
-			return client.Account{UUID: ref.UUID, Name: ref.Name}, nil
+			for _, account := range accounts {
+				if account.UUID == ref.UUID {
+					return account, nil
+				}
+			}
 		}
 	}
 	if cfg.DefaultAccount != "" {
 		if _, ref, ok := cfg.ResolveLocalAccount(cfg.DefaultAccount); ok {
-			return client.Account{UUID: ref.UUID, Name: ref.Name}, nil
+			for _, account := range accounts {
+				if account.UUID == ref.UUID {
+					return account, nil
+				}
+			}
 		}
 	}
 	if len(accounts) == 1 {
