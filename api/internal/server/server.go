@@ -824,7 +824,7 @@ func (h authHandler) handleVMResolve(w http.ResponseWriter, r *http.Request, sco
 	resp.VM = vm
 	resp.SSH.Host = host
 	resp.SSH.Port = vm.HostSSHPort
-	resp.SSH.DefaultUsername = h.cfg.DefaultSSHUser
+	resp.SSH.DefaultUsername = "root"
 	resp.SSH.Ready = vm.SSHReady
 	writeJSON(w, http.StatusOK, resp)
 }

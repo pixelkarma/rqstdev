@@ -87,7 +87,6 @@ Optional but useful:
 - `template_cpu`
 - `template_memory_mb`
 - `default_web_port`
-- `default_ssh_user`
 
 Example:
 

@@ -21,7 +21,6 @@ type Config struct {
 	QEMUBinaryPath   string `json:"qemu_binary_path"`
 	EmailScriptPath  string `json:"email_script_path"`
 	DefaultWebPort   int    `json:"default_web_port"`
-	DefaultSSHUser   string `json:"default_ssh_user"`
 	TemplateFile     string `json:"template_file"`
 	TemplateCPU      int    `json:"template_cpu"`
 	TemplateMemoryMB int    `json:"template_memory_mb"`
@@ -58,9 +57,6 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.DefaultWebPort == 0 {
 		cfg.DefaultWebPort = 80
-	}
-	if strings.TrimSpace(cfg.DefaultSSHUser) == "" {
-		cfg.DefaultSSHUser = "root"
 	}
 	if strings.TrimSpace(cfg.QEMUBinaryPath) == "" {
 		cfg.QEMUBinaryPath = "qemu-system-x86_64"
