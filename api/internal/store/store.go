@@ -1341,7 +1341,7 @@ func (s *Store) VMsForAccount(ctx context.Context, accountID int64, accountUUID 
 			v.cpu_count, v.memory_mb, t.uuid, t.name, COALESCE(v.last_error, '')
 		FROM vms v
 		JOIN vm_templates t ON t.id = v.template_id
-		WHERE account_id = ?
+		WHERE v.account_id = ?
 		ORDER BY v.created_at ASC, v.id ASC
 	`, accountID)
 	if err != nil {
