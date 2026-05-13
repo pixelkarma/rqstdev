@@ -241,6 +241,63 @@ Current runtime files include:
 - `qmp.sock`
 - `serial.log`
 
+## CLI Usage
+
+Global option:
+
+- `--account <name|alias|uuid>` overrides the active account for a single command
+
+Top-level commands:
+
+```sh
+rqstdev
+rqstdev help
+rqstdev signup
+rqstdev login
+rqstdev logout
+rqstdev invites
+rqstdev invites accept <invite-uuid>
+rqstdev invites refuse <invite-uuid>
+rqstdev list
+rqstdev add [vm-name] [guest-web-port]
+rqstdev delete [vm-name] [--force]
+rqstdev poweron [vm-name]
+rqstdev poweroff [vm-name]
+rqstdev kill [vm-name]
+rqstdev ssh [user@]vm-name
+rqstdev ssh-copy-id [user@]vm-name
+rqstdev port add [vm-name] <public-port>:<guest-port>
+rqstdev port remove [vm-name] <public-port>
+rqstdev port list [vm-name]
+```
+
+Account commands:
+
+```sh
+rqstdev account
+rqstdev account create <name>
+rqstdev account add <remote-account> [local-alias]
+rqstdev account remove <alias|name|uuid>
+rqstdev account default <alias|name|uuid>
+rqstdev account use <alias|name|uuid>
+rqstdev account transfer <email>
+rqstdev account forgot <email>
+rqstdev account user invite <email> [user|admin]
+rqstdev account user revoke <email|user-uuid>
+```
+
+Behavior notes:
+
+- `rqstdev` with no command opens the interactive root flow
+- when a VM name is omitted for VM, SSH, and port commands, the CLI prompts you to select one
+- `rqstdev add` defaults the guest web port to `80`
+- `rqstdev delete` requires typing `DELETE` unless `--force` is provided
+- `rqstdev ssh vm-name` defaults to `root`
+- `rqstdev ssh-copy-id vm-name` defaults to `root` and lets you choose a public key from the default `~/.ssh` directory or enter a custom path
+- `rqstdev invites` with no subcommand opens the interactive invite list
+- `rqstdev account` with no subcommand lists remote accounts
+- `rqstdev account user invite` defaults the invited role to `user`
+
 ## Notes
 
 - VM web services are user-managed inside the guest
