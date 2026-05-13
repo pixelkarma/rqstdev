@@ -87,6 +87,7 @@ Optional but useful:
 - `template_cpu`
 - `template_memory_mb`
 - `default_web_port`
+- `email_script_path`
 
 Example:
 
@@ -101,7 +102,8 @@ Example:
   "qemu_binary_path": "/usr/bin/qemu-system-x86_64",
   "template_file": "/home/user/rqstdev/assets/default-disk.qcow2",
   "template_cpu": 1,
-  "template_memory_mb": 1024
+  "template_memory_mb": 1024,
+  "email_script_path": "/home/user/rqstdev/send-email-resend.py"
 }
 ```
 
@@ -115,6 +117,7 @@ Field notes:
 - `vms_dir` is where per-VM runtime directories are created
 - `template_file` should point at the base QCOW2 image used for cloning new VMs
 - `template_cpu` and `template_memory_mb` define the single VM profile used for new machines
+- `email_script_path` enables email-based login challenges and password reset delivery; see the example sender script at [scripts/send-email-resend.py](/Users/admin/Documents/Projects/rqstdev/scripts/send-email-resend.py)
 
 ## Proxy Model
 
