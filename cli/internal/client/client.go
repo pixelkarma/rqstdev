@@ -41,13 +41,6 @@ type Invite struct {
 	CreatedAt   string `json:"createdAt"`
 }
 
-type Template struct {
-	UUID            string `json:"uuid"`
-	Name            string `json:"name"`
-	DefaultCPU      int    `json:"defaultCPU"`
-	DefaultMemoryMB int    `json:"defaultMemoryMB"`
-}
-
 type VM struct {
 	UUID         string `json:"uuid"`
 	Name         string `json:"name"`
@@ -250,17 +243,6 @@ func (c *Client) TransferAccount(accountUUID, email string) error {
 	return c.doJSON(http.MethodPost, path, map[string]string{"email": email}, nil)
 }
 
-func (c *Client) ListTemplates(accountUUID string) ([]Template, error) {
-	var resp struct {
-		Templates []Template `json:"templates"`
-	}
-	path := fmt.Sprintf("/v1/accounts/%s/templates", url.PathEscape(strings.TrimSpace(accountUUID)))
-	if err := c.doJSON(http.MethodGet, path, nil, &resp); err != nil {
-		return nil, err
-	}
-	return resp.Templates, nil
-}
-
 func (c *Client) ListVMs(accountUUID string) ([]VM, error) {
 	var resp struct {
 		VMs []VM `json:"vms"`
@@ -272,14 +254,13 @@ func (c *Client) ListVMs(accountUUID string) ([]VM, error) {
 	return resp.VMs, nil
 }
 
-func (c *Client) CreateVM(accountUUID, name, templateUUID string, guestWebPort int) (VM, error) {
+func (c *Client) CreateVM(accountUUID, name string, guestWebPort int) (VM, error) {
 	var resp struct {
 		VM VM `json:"vm"`
 	}
 	path := fmt.Sprintf("/v1/accounts/%s/vms", url.PathEscape(strings.TrimSpace(accountUUID)))
 	req := map[string]any{
 		"name":         name,
-		"templateUUID": templateUUID,
 		"guestWebPort": guestWebPort,
 	}
 	if err := c.doJSON(http.MethodPost, path, req, &resp); err != nil {

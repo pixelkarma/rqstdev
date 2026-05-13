@@ -678,44 +678,15 @@ func handleAdd(w io.Writer, cfg config.Config, sess session.State, api *client.C
 	if err != nil {
 		return err
 	}
-	templates, err := api.ListTemplates(account.UUID)
-	if err != nil {
-		return handleClientError(cfg.BaseURL, err)
-	}
-	if len(templates) == 0 {
-		return errors.New("no templates are available")
-	}
 	vmName := strings.TrimSpace(firstArg(args))
-
-	templateArg := strings.TrimSpace(secondArg(args))
 	guestPortArg := ""
-	template := templates[0]
-	if vmName == "" || (len(templates) > 1 && templateArg == "") || guestPortArg == "" {
-		var selectedTemplate string
-		if len(templates) > 1 {
-			selectedTemplate = template.Name
-		}
-		if templateArg != "" {
-			selectedTemplate = templateArg
-		}
-		vmName, templateArg, guestPortArg, err = addInputs(vmName, selectedTemplate, guestPortArg, templates)
-		if err != nil {
-			return err
-		}
+	if len(args) > 1 {
+		guestPortArg = strings.TrimSpace(args[1])
 	}
-	if len(templates) > 1 {
-		template, err = resolveTemplate(templates, templateArg)
+	if vmName == "" || guestPortArg == "" {
+		vmName, guestPortArg, err = addInputs(vmName, guestPortArg)
 		if err != nil {
 			return err
-		}
-	} else if templateArg != "" {
-		if _, convErr := strconv.Atoi(templateArg); convErr == nil {
-			guestPortArg = templateArg
-		} else {
-			template, err = resolveTemplate(templates, templateArg)
-			if err != nil {
-				return err
-			}
 		}
 	}
 	guestPort := 80
@@ -724,7 +695,7 @@ func handleAdd(w io.Writer, cfg config.Config, sess session.State, api *client.C
 			return errors.New("guest web port must be numeric")
 		}
 	}
-	vm, err := api.CreateVM(account.UUID, vmName, template.UUID, guestPort)
+	vm, err := api.CreateVM(account.UUID, vmName, guestPort)
 	if err != nil {
 		return handleClientError(cfg.BaseURL, err)
 	}
@@ -1269,58 +1240,33 @@ func selectPublicKeyPath() (string, error) {
 	return prompt(reader, "Public key path", "")
 }
 
-func addInputs(vmName, templateName, guestPort string, templates []client.Template) (string, string, string, error) {
+func addInputs(vmName, guestPort string) (string, string, error) {
 	if tui.CanUse() {
-		var templateValue string
-		if len(templates) == 1 {
-			templateValue = templates[0].Name
-		} else {
-			options := make([]tui.Option, 0, len(templates))
-			initial := 0
-			for i, template := range templates {
-				options = append(options, tui.Option{Label: template.Name})
-				if template.Name == templateName || template.UUID == templateName {
-					initial = i
-				}
-			}
-			index, err := tui.Select("Choose a template", nil, options, initial)
-			if err != nil {
-				return "", "", "", err
-			}
-			templateValue = templates[index].Name
-		}
 		values, err := tui.Inputs("Create VM", nil, []tui.Field{
 			{Key: "name", Label: "VM name", Value: vmName},
 			{Key: "port", Label: "Guest web port", Value: defaultString(guestPort, "80")},
 		})
 		if err != nil {
-			return "", "", "", err
+			return "", "", err
 		}
-		return values["name"], templateValue, values["port"], nil
+		return values["name"], values["port"], nil
 	}
 	reader := bufio.NewReader(os.Stdin)
 	if vmName == "" {
 		value, err := prompt(reader, "VM name", "")
 		if err != nil {
-			return "", "", "", err
+			return "", "", err
 		}
 		vmName = value
-	}
-	if len(templates) > 1 && templateName == "" {
-		value, err := prompt(reader, "Template UUID or name", templates[0].Name)
-		if err != nil {
-			return "", "", "", err
-		}
-		templateName = value
 	}
 	if guestPort == "" {
 		value, err := prompt(reader, "Guest web port", "80")
 		if err != nil {
-			return "", "", "", err
+			return "", "", err
 		}
 		guestPort = value
 	}
-	return vmName, templateName, guestPort, nil
+	return vmName, guestPort, nil
 }
 
 func deleteConfirmation(vmName string) error {
@@ -1414,16 +1360,6 @@ func parsePortMapping(value string) (int, int, error) {
 		return 0, 0, errors.New("guest port must be numeric")
 	}
 	return publicPort, guestPort, nil
-}
-
-func resolveTemplate(templates []client.Template, identifier string) (client.Template, error) {
-	identifier = strings.TrimSpace(identifier)
-	for _, template := range templates {
-		if template.UUID == identifier || strings.EqualFold(template.Name, identifier) {
-			return template, nil
-		}
-	}
-	return client.Template{}, fmt.Errorf("template %q not found", identifier)
 }
 
 func resolveVMArgument(api *client.Client, accountUUID string, args []string) (string, []string, error) {

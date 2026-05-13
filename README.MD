@@ -80,8 +80,14 @@ Current required config fields:
 - `data_dir`
 - `vms_dir`
 - `qemu_binary_path`
-- `default_template_name`
-- `default_template_image_path`
+- `template_file`
+
+Optional but useful:
+
+- `template_cpu`
+- `template_memory_mb`
+- `default_web_port`
+- `default_ssh_user`
 
 Example:
 
@@ -94,8 +100,9 @@ Example:
   "data_dir": "/home/user/rqstdev/data",
   "vms_dir": "/home/user/rqstdev/vms",
   "qemu_binary_path": "/usr/bin/qemu-system-x86_64",
-  "default_template_name": "default",
-  "default_template_image_path": "/home/user/rqstdev/assets/default-disk.qcow2"
+  "template_file": "/home/user/rqstdev/assets/default-disk.qcow2",
+  "template_cpu": 1,
+  "template_memory_mb": 1024
 }
 ```
 
@@ -107,7 +114,8 @@ Field notes:
 - `db_path` is the SQLite database file
 - `data_dir` is the server data root
 - `vms_dir` is where per-VM runtime directories are created
-- `default_template_image_path` should point at the base QCOW2 image used for cloning new VMs
+- `template_file` should point at the base QCOW2 image used for cloning new VMs
+- `template_cpu` and `template_memory_mb` define the single VM profile used for new machines
 
 ## Proxy Model
 

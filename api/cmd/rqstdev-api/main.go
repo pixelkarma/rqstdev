@@ -41,13 +41,6 @@ func main() {
 	}
 	defer st.Close()
 
-	initCtx, initCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := st.EnsureDefaultTemplate(initCtx, cfg.DefaultTemplateName, cfg.DefaultTemplateImagePath); err != nil {
-		initCancel()
-		logger.Fatalf("seed default template: %v", err)
-	}
-	initCancel()
-
 	srv := server.New(cfg, logger, st)
 
 	go func() {

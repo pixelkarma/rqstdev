@@ -12,19 +12,19 @@ import (
 const defaultConfigPath = "/etc/rqstdev/config.json"
 
 type Config struct {
-	ListenAddr               string `json:"listen_addr"`
-	BaseURL                  string `json:"base_url"`
-	BaseDomain               string `json:"base_domain"`
-	DBPath                   string `json:"db_path"`
-	DataDir                  string `json:"data_dir"`
-	VMsDir                   string `json:"vms_dir"`
-	QEMUBinaryPath           string `json:"qemu_binary_path"`
-	EmailScriptPath          string `json:"email_script_path"`
-	DefaultWebPort           int    `json:"default_web_port"`
-	DefaultSSHUser           string `json:"default_ssh_user"`
-	TemplatesBaseDir         string `json:"templates_base_dir"`
-	DefaultTemplateName      string `json:"default_template_name"`
-	DefaultTemplateImagePath string `json:"default_template_image_path"`
+	ListenAddr       string `json:"listen_addr"`
+	BaseURL          string `json:"base_url"`
+	BaseDomain       string `json:"base_domain"`
+	DBPath           string `json:"db_path"`
+	DataDir          string `json:"data_dir"`
+	VMsDir           string `json:"vms_dir"`
+	QEMUBinaryPath   string `json:"qemu_binary_path"`
+	EmailScriptPath  string `json:"email_script_path"`
+	DefaultWebPort   int    `json:"default_web_port"`
+	DefaultSSHUser   string `json:"default_ssh_user"`
+	TemplateFile     string `json:"template_file"`
+	TemplateCPU      int    `json:"template_cpu"`
+	TemplateMemoryMB int    `json:"template_memory_mb"`
 }
 
 func FlagPath() string {
@@ -68,11 +68,11 @@ func applyDefaults(cfg *Config) {
 	if strings.TrimSpace(cfg.VMsDir) == "" && strings.TrimSpace(cfg.DataDir) != "" {
 		cfg.VMsDir = filepath.Join(cfg.DataDir, "vms")
 	}
-	if strings.TrimSpace(cfg.DefaultTemplateName) == "" {
-		cfg.DefaultTemplateName = "default"
+	if cfg.TemplateCPU <= 0 {
+		cfg.TemplateCPU = 1
 	}
-	if strings.TrimSpace(cfg.DefaultTemplateImagePath) == "" && strings.TrimSpace(cfg.TemplatesBaseDir) != "" {
-		cfg.DefaultTemplateImagePath = filepath.Join(cfg.TemplatesBaseDir, "default-disk.qcow2")
+	if cfg.TemplateMemoryMB <= 0 {
+		cfg.TemplateMemoryMB = 1024
 	}
 }
 
@@ -88,13 +88,14 @@ func validate(cfg Config) error {
 		return fmt.Errorf("data_dir is required")
 	case strings.TrimSpace(cfg.VMsDir) == "":
 		return fmt.Errorf("vms_dir is required")
-	case strings.TrimSpace(cfg.DefaultTemplateImagePath) == "":
-		return fmt.Errorf("default_template_image_path is required")
+	case strings.TrimSpace(cfg.TemplateFile) == "":
+		return fmt.Errorf("template_file is required")
 	}
 
 	cfg.DBPath = filepath.Clean(cfg.DBPath)
 	cfg.DataDir = filepath.Clean(cfg.DataDir)
 	cfg.VMsDir = filepath.Clean(cfg.VMsDir)
+	cfg.TemplateFile = filepath.Clean(cfg.TemplateFile)
 
 	return nil
 }

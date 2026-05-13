@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -74,7 +75,6 @@ type resetRequest struct {
 
 type createVMRequest struct {
 	Name         string `json:"name"`
-	TemplateUUID string `json:"templateUUID"`
 	GuestWebPort int    `json:"guestWebPort"`
 }
 
@@ -611,8 +611,6 @@ func (h authHandler) handleAccountSubroutes(w http.ResponseWriter, r *http.Reque
 		h.handleAccountGet(w, r, scope)
 	case tail == "/invites" && r.Method == http.MethodPost:
 		h.handleAccountInvite(w, r, scope)
-	case tail == "/templates" && r.Method == http.MethodGet:
-		h.handleTemplatesList(w, r, scope)
 	case tail == "/vms" && r.Method == http.MethodGet:
 		h.handleVMsList(w, r, scope)
 	case tail == "/vms" && r.Method == http.MethodPost:
@@ -677,15 +675,6 @@ func (h authHandler) handleInviteSubroutes(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-func (h authHandler) handleTemplatesList(w http.ResponseWriter, r *http.Request, scope store.AccountScope) {
-	templates, err := h.store.VisibleTemplatesForAccount(r.Context(), scope.AccountID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load templates.")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"templates": templates})
-}
-
 func (h authHandler) handleVMsList(w http.ResponseWriter, r *http.Request, scope store.AccountScope) {
 	vms, err := h.store.VMsForAccount(r.Context(), scope.AccountID, scope.AccountUUID)
 	if err != nil {
@@ -709,22 +698,12 @@ func (h authHandler) handleVMCreate(w http.ResponseWriter, r *http.Request, scop
 		writeError(w, http.StatusBadRequest, "validation_error", err.Error())
 		return
 	}
-	if strings.TrimSpace(req.Name) == "" || strings.TrimSpace(req.TemplateUUID) == "" {
-		writeError(w, http.StatusBadRequest, "validation_error", "name and templateUUID are required")
+	if strings.TrimSpace(req.Name) == "" {
+		writeError(w, http.StatusBadRequest, "validation_error", "name is required")
 		return
 	}
 	if req.GuestWebPort == 0 {
 		req.GuestWebPort = h.cfg.DefaultWebPort
-	}
-
-	template, err := h.store.TemplateForAccount(r.Context(), scope.AccountID, req.TemplateUUID)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", "Template not found.")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to load template.")
-		return
 	}
 
 	vmUUID := newUUIDLike()
@@ -734,12 +713,10 @@ func (h authHandler) handleVMCreate(w http.ResponseWriter, r *http.Request, scop
 		AccountID:     scope.AccountID,
 		AccountUUID:   scope.AccountUUID,
 		Name:          req.Name,
-		TemplateID:    template.ID,
-		TemplateUUID:  template.UUID,
-		TemplateName:  template.Name,
+		TemplateName:  filepath.Base(h.cfg.TemplateFile),
 		GuestWebPort:  req.GuestWebPort,
-		CPUCount:      template.DefaultCPU,
-		MemoryMB:      template.DefaultMemoryMB,
+		CPUCount:      h.cfg.TemplateCPU,
+		MemoryMB:      h.cfg.TemplateMemoryMB,
 		RuntimeDir:    files.RuntimeDir,
 		DiskImagePath: files.DiskImagePath,
 		PIDFilePath:   files.PIDFilePath,
@@ -756,12 +733,12 @@ func (h authHandler) handleVMCreate(w http.ResponseWriter, r *http.Request, scop
 		return
 	}
 
-	if err := h.vmrt.PrepareDisk(files, template.DiskImageRef); err != nil {
+	if err := h.vmrt.PrepareDisk(files, h.cfg.TemplateFile); err != nil {
 		_ = h.store.UpdateVMState(r.Context(), vm.ID, "error", err.Error())
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to prepare VM disk.")
 		return
 	}
-	if err := h.vmrt.StartVM(vm, files, template.DefaultCPU, template.DefaultMemoryMB); err != nil {
+	if err := h.vmrt.StartVM(vm, files, h.cfg.TemplateCPU, h.cfg.TemplateMemoryMB); err != nil {
 		_ = h.store.UpdateVMState(r.Context(), vm.ID, "error", err.Error())
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to start VM.")
 		return

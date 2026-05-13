@@ -65,21 +65,11 @@ type AccountScope struct {
 	Role        string
 }
 
-type Template struct {
-	ID              int64  `json:"-"`
-	UUID            string `json:"uuid"`
-	Name            string `json:"name"`
-	DiskImageRef    string `json:"-"`
-	DefaultCPU      int    `json:"defaultCPU"`
-	DefaultMemoryMB int    `json:"defaultMemoryMB"`
-}
-
 type VM struct {
 	ID            int64  `json:"-"`
 	UUID          string `json:"uuid"`
 	Name          string `json:"name"`
 	AccountUUID   string `json:"accountUUID,omitempty"`
-	TemplateUUID  string `json:"templateUUID,omitempty"`
 	TemplateName  string `json:"templateName,omitempty"`
 	State         string `json:"state"`
 	GuestWebPort  int    `json:"guestWebPort"`
@@ -129,8 +119,6 @@ type CreateVMParams struct {
 	AccountID     int64
 	AccountUUID   string
 	Name          string
-	TemplateID    int64
-	TemplateUUID  string
 	TemplateName  string
 	GuestWebPort  int
 	CPUCount      int
@@ -250,24 +238,12 @@ var schemaStatements = []string{
 		created_at TEXT NOT NULL,
 		used_at TEXT
 	);`,
-	`CREATE TABLE IF NOT EXISTS vm_templates (
-		id INTEGER PRIMARY KEY,
-		uuid TEXT NOT NULL UNIQUE,
-		name TEXT NOT NULL,
-		account_id INTEGER REFERENCES accounts(id) ON DELETE CASCADE,
-		disk_image_ref TEXT NOT NULL,
-		default_cpu INTEGER NOT NULL,
-		default_memory_mb INTEGER NOT NULL,
-		active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
-		created_at TEXT NOT NULL,
-		updated_at TEXT NOT NULL
-	);`,
 	`CREATE TABLE IF NOT EXISTS vms (
 		id INTEGER PRIMARY KEY,
 		uuid TEXT NOT NULL UNIQUE,
 		name TEXT NOT NULL UNIQUE,
 		account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
-		template_id INTEGER NOT NULL REFERENCES vm_templates(id) ON DELETE RESTRICT,
+		template_name TEXT NOT NULL,
 		state TEXT NOT NULL CHECK (state IN ('creating', 'running', 'stopped', 'deleting', 'error')),
 		ssh_ready INTEGER NOT NULL DEFAULT 0 CHECK (ssh_ready IN (0,1)),
 		web_ready INTEGER NOT NULL DEFAULT 0 CHECK (web_ready IN (0,1)),
@@ -299,7 +275,6 @@ var schemaStatements = []string{
 	`CREATE INDEX IF NOT EXISTS idx_account_invites_user_status ON account_invites(user_id, status);`,
 	`CREATE INDEX IF NOT EXISTS idx_session_tokens_user_id ON session_tokens(user_id);`,
 	`CREATE INDEX IF NOT EXISTS idx_auth_attempts_user_purpose_created ON auth_attempts(user_id, purpose, created_at);`,
-	`CREATE INDEX IF NOT EXISTS idx_vm_templates_account_active ON vm_templates(account_id, active);`,
 	`CREATE INDEX IF NOT EXISTS idx_vms_account_id ON vms(account_id);`,
 	`CREATE INDEX IF NOT EXISTS idx_vms_state ON vms(state);`,
 }
@@ -1127,82 +1102,6 @@ func (s *Store) TransferAccountOwnership(ctx context.Context, accountID, actorUs
 	return nil
 }
 
-func (s *Store) EnsureDefaultTemplate(ctx context.Context, name, imagePath string) error {
-	row := s.db.QueryRowContext(ctx, `
-		SELECT id
-		FROM vm_templates
-		WHERE account_id IS NULL AND name = ? AND disk_image_ref = ?
-		LIMIT 1
-	`, name, imagePath)
-
-	var existingID int64
-	err := row.Scan(&existingID)
-	switch {
-	case err == nil:
-		_, err = s.db.ExecContext(ctx, `
-			UPDATE vm_templates
-			SET active = 1, updated_at = ?
-			WHERE id = ?
-		`, utcNow(), existingID)
-		return err
-	case !errors.Is(err, sql.ErrNoRows):
-		return fmt.Errorf("lookup default template: %w", err)
-	}
-
-	now := utcNow()
-	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO vm_templates (
-			uuid, name, account_id, disk_image_ref, default_cpu, default_memory_mb, active, created_at, updated_at
-		) VALUES (?, ?, NULL, ?, 1, 1024, 1, ?, ?)
-	`, newUUIDLike(), name, imagePath, now, now)
-	if err != nil {
-		return fmt.Errorf("insert default template: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) VisibleTemplatesForAccount(ctx context.Context, accountID int64) ([]Template, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, uuid, name, disk_image_ref, default_cpu, default_memory_mb
-		FROM vm_templates
-		WHERE active = 1 AND (account_id IS NULL OR account_id = ?)
-		ORDER BY account_id IS NOT NULL, name ASC
-	`, accountID)
-	if err != nil {
-		return nil, fmt.Errorf("query templates: %w", err)
-	}
-	defer rows.Close()
-
-	var templates []Template
-	for rows.Next() {
-		var t Template
-		if err := rows.Scan(&t.ID, &t.UUID, &t.Name, &t.DiskImageRef, &t.DefaultCPU, &t.DefaultMemoryMB); err != nil {
-			return nil, fmt.Errorf("scan template: %w", err)
-		}
-		templates = append(templates, t)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate templates: %w", err)
-	}
-	return templates, nil
-}
-
-func (s *Store) TemplateForAccount(ctx context.Context, accountID int64, templateUUID string) (Template, error) {
-	var t Template
-	row := s.db.QueryRowContext(ctx, `
-		SELECT id, uuid, name, disk_image_ref, default_cpu, default_memory_mb
-		FROM vm_templates
-		WHERE uuid = ? AND active = 1 AND (account_id IS NULL OR account_id = ?)
-	`, templateUUID, accountID)
-	if err := row.Scan(&t.ID, &t.UUID, &t.Name, &t.DiskImageRef, &t.DefaultCPU, &t.DefaultMemoryMB); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return Template{}, ErrNotFound
-		}
-		return Template{}, fmt.Errorf("lookup template: %w", err)
-	}
-	return t, nil
-}
-
 func (s *Store) CreateVM(ctx context.Context, params CreateVMParams) (VM, error) {
 	name := strings.TrimSpace(params.Name)
 	if name == "" || strings.TrimSpace(params.UUID) == "" {
@@ -1211,11 +1110,11 @@ func (s *Store) CreateVM(ctx context.Context, params CreateVMParams) (VM, error)
 	now := utcNow()
 	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO vms (
-			uuid, name, account_id, template_id, state, ssh_ready, web_ready, guest_ip_address, guest_web_port,
+			uuid, name, account_id, template_name, state, ssh_ready, web_ready, guest_ip_address, guest_web_port,
 			cpu_count, memory_mb, runtime_dir, disk_image_path, pid_file_path, qmp_socket_path,
 			serial_log_path, last_error, created_at, updated_at
 		) VALUES (?, ?, ?, ?, 'creating', 0, 0, '', ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?)
-	`, params.UUID, name, params.AccountID, params.TemplateID, params.GuestWebPort, params.CPUCount, params.MemoryMB,
+	`, params.UUID, name, params.AccountID, params.TemplateName, params.GuestWebPort, params.CPUCount, params.MemoryMB,
 		params.RuntimeDir, params.DiskImagePath, params.PIDFilePath, params.QMPSocketPath, params.SerialLogPath, now, now)
 	if err != nil {
 		if isConstraintErr(err) {
@@ -1234,7 +1133,6 @@ func (s *Store) CreateVM(ctx context.Context, params CreateVMParams) (VM, error)
 		UUID:          params.UUID,
 		Name:          name,
 		AccountUUID:   params.AccountUUID,
-		TemplateUUID:  params.TemplateUUID,
 		TemplateName:  params.TemplateName,
 		State:         "creating",
 		GuestWebPort:  params.GuestWebPort,
@@ -1337,12 +1235,11 @@ func (s *Store) AllVMs(ctx context.Context) ([]VM, error) {
 func (s *Store) VMsForAccount(ctx context.Context, accountID int64, accountUUID string) ([]VM, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT
-			v.id, v.uuid, v.name, v.state, v.ssh_ready, v.web_ready, v.guest_web_port,
-			v.cpu_count, v.memory_mb, t.uuid, t.name, COALESCE(v.last_error, '')
-		FROM vms v
-		JOIN vm_templates t ON t.id = v.template_id
-		WHERE v.account_id = ?
-		ORDER BY v.created_at ASC, v.id ASC
+			id, uuid, name, state, ssh_ready, web_ready, guest_web_port,
+			cpu_count, memory_mb, template_name, COALESCE(last_error, '')
+		FROM vms
+		WHERE account_id = ?
+		ORDER BY created_at ASC, id ASC
 	`, accountID)
 	if err != nil {
 		return nil, fmt.Errorf("query vms: %w", err)
@@ -1363,7 +1260,6 @@ func (s *Store) VMsForAccount(ctx context.Context, accountID int64, accountUUID 
 			&vm.GuestWebPort,
 			&vm.CPUCount,
 			&vm.MemoryMB,
-			&vm.TemplateUUID,
 			&vm.TemplateName,
 			&vm.LastError,
 		); err != nil {
@@ -1388,11 +1284,10 @@ func (s *Store) VMForAccountByName(ctx context.Context, accountID int64, account
 	row := s.db.QueryRowContext(ctx, `
 		SELECT
 			v.id, v.uuid, v.name, v.state, v.ssh_ready, v.web_ready, v.guest_web_port,
-			t.uuid, t.name,
+			v.template_name,
 			cpu_count, memory_mb, runtime_dir, disk_image_path, pid_file_path,
 			qmp_socket_path, serial_log_path, COALESCE(last_error, '')
 		FROM vms v
-		JOIN vm_templates t ON t.id = v.template_id
 		WHERE v.account_id = ? AND v.name = ?
 		LIMIT 1
 	`, accountID, strings.TrimSpace(vmName))
@@ -1404,7 +1299,6 @@ func (s *Store) VMForAccountByName(ctx context.Context, accountID int64, account
 		&sshReadyInt,
 		&webReadyInt,
 		&vm.GuestWebPort,
-		&vm.TemplateUUID,
 		&vm.TemplateName,
 		&vm.CPUCount,
 		&vm.MemoryMB,
