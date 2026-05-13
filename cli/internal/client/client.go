@@ -52,7 +52,10 @@ type VM struct {
 	UUID         string `json:"uuid"`
 	Name         string `json:"name"`
 	State        string `json:"state"`
+	TemplateName string `json:"templateName"`
 	GuestWebPort int    `json:"guestWebPort"`
+	CPUCount     int    `json:"cpuCount"`
+	MemoryMB     int    `json:"memoryMB"`
 	SSHReady     bool   `json:"sshReady"`
 	LastError    string `json:"lastError,omitempty"`
 }

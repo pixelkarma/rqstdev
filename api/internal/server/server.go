@@ -736,6 +736,7 @@ func (h authHandler) handleVMCreate(w http.ResponseWriter, r *http.Request, scop
 		Name:          req.Name,
 		TemplateID:    template.ID,
 		TemplateUUID:  template.UUID,
+		TemplateName:  template.Name,
 		GuestWebPort:  req.GuestWebPort,
 		CPUCount:      template.DefaultCPU,
 		MemoryMB:      template.DefaultMemoryMB,

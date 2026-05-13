@@ -80,6 +80,7 @@ type VM struct {
 	Name          string `json:"name"`
 	AccountUUID   string `json:"accountUUID,omitempty"`
 	TemplateUUID  string `json:"templateUUID,omitempty"`
+	TemplateName  string `json:"templateName,omitempty"`
 	State         string `json:"state"`
 	GuestWebPort  int    `json:"guestWebPort"`
 	SSHReady      bool   `json:"sshReady"`
@@ -87,8 +88,8 @@ type VM struct {
 	HostSSHPort   int    `json:"-"`
 	HostWebPort   int    `json:"-"`
 	WebReady      bool   `json:"-"`
-	CPUCount      int    `json:"-"`
-	MemoryMB      int    `json:"-"`
+	CPUCount      int    `json:"cpuCount"`
+	MemoryMB      int    `json:"memoryMB"`
 	RuntimeDir    string `json:"-"`
 	DiskImagePath string `json:"-"`
 	PIDFilePath   string `json:"-"`
@@ -130,6 +131,7 @@ type CreateVMParams struct {
 	Name          string
 	TemplateID    int64
 	TemplateUUID  string
+	TemplateName  string
 	GuestWebPort  int
 	CPUCount      int
 	MemoryMB      int
@@ -1233,6 +1235,7 @@ func (s *Store) CreateVM(ctx context.Context, params CreateVMParams) (VM, error)
 		Name:          name,
 		AccountUUID:   params.AccountUUID,
 		TemplateUUID:  params.TemplateUUID,
+		TemplateName:  params.TemplateName,
 		State:         "creating",
 		GuestWebPort:  params.GuestWebPort,
 		HostSSHPort:   HostSSHPort(vmID),
@@ -1333,10 +1336,13 @@ func (s *Store) AllVMs(ctx context.Context) ([]VM, error) {
 
 func (s *Store) VMsForAccount(ctx context.Context, accountID int64, accountUUID string) ([]VM, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, uuid, name, state, ssh_ready, web_ready, guest_web_port, COALESCE(last_error, '')
-		FROM vms
+		SELECT
+			v.id, v.uuid, v.name, v.state, v.ssh_ready, v.web_ready, v.guest_web_port,
+			v.cpu_count, v.memory_mb, t.uuid, t.name, COALESCE(v.last_error, '')
+		FROM vms v
+		JOIN vm_templates t ON t.id = v.template_id
 		WHERE account_id = ?
-		ORDER BY created_at ASC, id ASC
+		ORDER BY v.created_at ASC, v.id ASC
 	`, accountID)
 	if err != nil {
 		return nil, fmt.Errorf("query vms: %w", err)
@@ -1347,7 +1353,20 @@ func (s *Store) VMsForAccount(ctx context.Context, accountID int64, accountUUID 
 	for rows.Next() {
 		var vm VM
 		var sshReadyInt, webReadyInt int
-		if err := rows.Scan(&vm.ID, &vm.UUID, &vm.Name, &vm.State, &sshReadyInt, &webReadyInt, &vm.GuestWebPort, &vm.LastError); err != nil {
+		if err := rows.Scan(
+			&vm.ID,
+			&vm.UUID,
+			&vm.Name,
+			&vm.State,
+			&sshReadyInt,
+			&webReadyInt,
+			&vm.GuestWebPort,
+			&vm.CPUCount,
+			&vm.MemoryMB,
+			&vm.TemplateUUID,
+			&vm.TemplateName,
+			&vm.LastError,
+		); err != nil {
 			return nil, fmt.Errorf("scan vm: %w", err)
 		}
 		vm.AccountUUID = accountUUID
@@ -1368,11 +1387,13 @@ func (s *Store) VMForAccountByName(ctx context.Context, accountID int64, account
 	var sshReadyInt, webReadyInt int
 	row := s.db.QueryRowContext(ctx, `
 		SELECT
-			id, uuid, name, state, ssh_ready, web_ready, guest_web_port,
+			v.id, v.uuid, v.name, v.state, v.ssh_ready, v.web_ready, v.guest_web_port,
+			t.uuid, t.name,
 			cpu_count, memory_mb, runtime_dir, disk_image_path, pid_file_path,
 			qmp_socket_path, serial_log_path, COALESCE(last_error, '')
-		FROM vms
-		WHERE account_id = ? AND name = ?
+		FROM vms v
+		JOIN vm_templates t ON t.id = v.template_id
+		WHERE v.account_id = ? AND v.name = ?
 		LIMIT 1
 	`, accountID, strings.TrimSpace(vmName))
 	if err := row.Scan(
@@ -1383,6 +1404,8 @@ func (s *Store) VMForAccountByName(ctx context.Context, accountID int64, account
 		&sshReadyInt,
 		&webReadyInt,
 		&vm.GuestWebPort,
+		&vm.TemplateUUID,
+		&vm.TemplateName,
 		&vm.CPUCount,
 		&vm.MemoryMB,
 		&vm.RuntimeDir,

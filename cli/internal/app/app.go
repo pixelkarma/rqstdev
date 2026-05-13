@@ -124,7 +124,7 @@ func handleAuthenticatedRoot(w io.Writer, cfg config.Config, sess session.State,
 		if err == nil {
 			lines = append(lines, fmt.Sprintf("VMs in current account: %d", len(vms)))
 			for _, vm := range vms {
-				lines = append(lines, fmt.Sprintf("  %s\t%s\tssh=%t", vm.Name, vm.State, vm.SSHReady))
+				lines = append(lines, fmt.Sprintf("  %s\t%s\ttemplate=%s\tcpu=%d\tram=%dMB", vm.Name, vm.State, vm.TemplateName, vm.CPUCount, vm.MemoryMB))
 			}
 		}
 	}
@@ -661,7 +661,7 @@ func handleList(w io.Writer, cfg config.Config, sess session.State, api *client.
 		return err
 	}
 	for _, vm := range vms {
-		if _, err := fmt.Fprintf(w, "%s\t%s\tssh=%t\n", vm.Name, vm.State, vm.SSHReady); err != nil {
+		if _, err := fmt.Fprintf(w, "%s\t%s\ttemplate=%s\tcpu=%d\tram=%dMB\n", vm.Name, vm.State, vm.TemplateName, vm.CPUCount, vm.MemoryMB); err != nil {
 			return err
 		}
 		if vm.LastError != "" {
@@ -728,7 +728,7 @@ func handleAdd(w io.Writer, cfg config.Config, sess session.State, api *client.C
 	if err != nil {
 		return handleClientError(cfg.BaseURL, err)
 	}
-	_, err = fmt.Fprintf(w, "Created VM %s (%s) state=%s\n", vm.Name, vm.UUID, vm.State)
+	_, err = fmt.Fprintf(w, "Created VM %s (%s) state=%s template=%s cpu=%d ram=%dMB\n", vm.Name, vm.UUID, vm.State, vm.TemplateName, vm.CPUCount, vm.MemoryMB)
 	return err
 }
 
@@ -778,7 +778,7 @@ func handlePowerAction(w io.Writer, cfg config.Config, sess session.State, api *
 	if err != nil {
 		return handleClientError(cfg.BaseURL, err)
 	}
-	_, err = fmt.Fprintf(w, "%s\t%s\tssh=%t\n", vm.Name, vm.State, vm.SSHReady)
+	_, err = fmt.Fprintf(w, "%s\t%s\ttemplate=%s\tcpu=%d\tram=%dMB\n", vm.Name, vm.State, vm.TemplateName, vm.CPUCount, vm.MemoryMB)
 	return err
 }
 
@@ -1459,7 +1459,7 @@ func selectVM(vms []client.VM) (string, error) {
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Fprintln(os.Stdout, "Select a VM:")
 	for i, vm := range vms {
-		fmt.Fprintf(os.Stdout, "  %d. %s\t%s\tssh=%t\n", i+1, vm.Name, vm.State, vm.SSHReady)
+		fmt.Fprintf(os.Stdout, "  %d. %s\t%s\ttemplate=%s\tcpu=%d\tram=%dMB\n", i+1, vm.Name, vm.State, vm.TemplateName, vm.CPUCount, vm.MemoryMB)
 	}
 	selection, err := prompt(reader, "VM number", "")
 	if err != nil {
