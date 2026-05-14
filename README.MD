@@ -73,25 +73,7 @@ The server binary reads a JSON config file. The current default flag is:
 rqstdev-api --config /etc/rqstdev/config.json
 ```
 
-Current required config fields:
-
-- `listen_addr`
-- `base_url`
-- `base_domain`
-- `db_path`
-- `data_dir`
-- `vms_dir`
-- `qemu_binary_path`
-- `template_file`
-
-Optional but useful:
-
-- `template_cpu`
-- `template_memory_mb`
-- `default_web_port`
-- `email_script_path`
-
-Example:
+Example configuration:
 
 ```json
 {
@@ -117,9 +99,11 @@ Field notes:
 - `db_path` is the SQLite database file
 - `data_dir` is the server data root
 - `vms_dir` is where per-VM runtime directories are created
+- `qemu_binary_path` should point at the `qemu-system-x86_64` executable
 - `template_file` should point at the base QCOW2 image used for cloning new VMs
-- `template_cpu` and `template_memory_mb` define the single VM profile used for new machines
-- `email_script_path` enables email-based login challenges and password reset delivery; see the example sender script at [scripts/send-email-resend.py](/Users/admin/Documents/Projects/rqstdev/scripts/send-email-resend.py)
+- `template_cpu` and `template_memory_mb` are optional and define the single VM profile used for new machines
+- `default_web_port` is optional and defaults to `80`
+- `email_script_path` is optional; when set, it enables email-based login challenges and password reset delivery. See [scripts/send-email-resend.py](/Users/admin/Documents/Projects/rqstdev/scripts/send-email-resend.py)
 
 ## Proxy Model
 
